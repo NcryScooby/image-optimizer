@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -54,6 +55,8 @@ func Connect(url string) (*Client, error) {
 	return &Client{conn: conn, ch: ch}, nil
 }
 
+const clientPingTimeout = 2 * time.Second
+
 // QueueInspect returns the approximate number of ready messages in image.variants.
 func (c *Client) QueueInspect() (int, error) {
 	if c == nil || c.ch == nil {
@@ -64,6 +67,38 @@ func (c *Client) QueueInspect() (int, error) {
 		return 0, fmt.Errorf("queue: inspect %s: %w", QueueName, err)
 	}
 	return q.Messages, nil
+}
+
+// Ping verifies the AMQP channel is usable (QueueInspect) within a short timeout.
+func (c *Client) Ping(ctx context.Context) error {
+	if c == nil || c.ch == nil {
+		return fmt.Errorf("queue: client not connected")
+	}
+	if c.conn != nil && c.conn.IsClosed() {
+		return fmt.Errorf("queue: connection closed")
+	}
+	if c.ch.IsClosed() {
+		return fmt.Errorf("queue: channel closed")
+	}
+
+	pingCtx, cancel := context.WithTimeout(ctx, clientPingTimeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.QueueInspect()
+		done <- err
+	}()
+
+	select {
+	case <-pingCtx.Done():
+		return fmt.Errorf("queue: ping: %w", pingCtx.Err())
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("queue: ping: %w", err)
+		}
+		return nil
+	}
 }
 
 // Publish enqueues a variant processing job.

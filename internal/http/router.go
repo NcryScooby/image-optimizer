@@ -26,11 +26,13 @@ type imageStore interface {
 	GetVariantByHash(ctx context.Context, imageID uuid.UUID, paramsHash string) (db.Variant, error)
 	UpsertPendingVariant(ctx context.Context, imageID uuid.UUID, paramsHash string, paramsJSON []byte) (db.Variant, bool, error)
 	DeletePendingVariant(ctx context.Context, id uuid.UUID) error
+	Ping(ctx context.Context) error
 }
 
 // jobQueue publishes variant processing jobs.
 type jobQueue interface {
 	Publish(ctx context.Context, variantID string) error
+	Ping(ctx context.Context) error
 }
 
 // blobStore reads and writes image blobs (S3/MinIO).
@@ -68,6 +70,7 @@ func NewRouter(h *Handler) http.Handler {
 	r.Use(middleware.Recoverer)
 
 	r.Get("/health", h.handleHealth)
+	r.Get("/ready", h.handleReady)
 	r.Handle("/metrics", promhttp.Handler())
 
 	r.Route("/images", func(r chi.Router) {

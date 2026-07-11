@@ -29,3 +29,18 @@ func NewPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 
 	return pool, nil
 }
+
+const storePingTimeout = 2 * time.Second
+
+// Ping verifies the pool can reach Postgres within a short timeout.
+func (s *Store) Ping(ctx context.Context) error {
+	if s == nil || s.pool == nil {
+		return fmt.Errorf("db: store not connected")
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, storePingTimeout)
+	defer cancel()
+	if err := s.pool.Ping(pingCtx); err != nil {
+		return fmt.Errorf("db: ping: %w", err)
+	}
+	return nil
+}

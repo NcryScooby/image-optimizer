@@ -10,6 +10,7 @@ data/variants/
 # Go
 /bin/
 /dist/
+/app
 *.exe
 *.test
 *.out

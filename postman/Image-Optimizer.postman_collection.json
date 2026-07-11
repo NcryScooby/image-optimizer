@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     "name": "Image Optimizer",
-    "description": "API Go híbrida: upload → disco/Postgres → variantes AVIF sob demanda (worker + imgproxy + RabbitMQ).\n\n**Fluxo típico**\n1. `POST /images` → guarda `id`\n2. `GET /images/:id` com params → `202` + `Retry-After` enquanto processa\n3. Repetir GET até `200` (`Content-Type: image/avif`)\n4. `DELETE /images/:id` quando não precisar mais\n\n**Formatos de upload:** JPEG, PNG, WebP · **Max:** 10MB\n\n**Query GET:** `w`, `h`, `crop` (center|top|bottom|left|right), `q` (1–100, default 80), `fit` (cover|contain|fill)",
+    "description": "API Go híbrida: upload → MinIO/Postgres → variantes AVIF sob demanda (worker + imgproxy + RabbitMQ).\n\n**Fluxo típico**\n1. `POST /images` → guarda `id`\n2. `GET /images/:id` com params → `202` + `Retry-After` enquanto processa\n3. Repetir GET até `200` (`Content-Type: image/avif`)\n4. `DELETE /images/:id` quando não precisar mais\n\n**Health:** `GET /health` = liveness; `GET /ready` = Postgres + RabbitMQ (API `:8080`, worker metrics `:9091`). Ver `docs/readiness.md`.\n\n**Formatos de upload:** JPEG, PNG, WebP · **Max:** 10MB\n\n**Query GET:** `w`, `h`, `crop` (center|top|bottom|left|right), `q` (1–100, default 80), `fit` (cover|contain|fill)",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -11,16 +11,20 @@
       "value": "http://localhost:8080"
     },
     {
+      "key": "metricsUrl",
+      "value": "http://localhost:9091"
+    },
+    {
       "key": "imageId",
       "value": ""
     }
   ],
   "item": [
     {
-      "name": "Health",
+      "name": "Health & Ready",
       "item": [
         {
-          "name": "GET Health",
+          "name": "GET Health (API)",
           "request": {
             "method": "GET",
             "header": [],
@@ -29,7 +33,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["health"]
             },
-            "description": "Liveness. Resposta `200`:\n```json\n{\"status\":\"ok\"}\n```"
+            "description": "Liveness (sem deps). Sempre `200`:\n```json\n{\"status\":\"ok\"}\n```"
           },
           "response": [
             {
@@ -53,6 +57,139 @@
                 }
               ],
               "body": "{\n  \"status\": \"ok\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET Ready (API)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/ready",
+              "host": ["{{baseUrl}}"],
+              "path": ["ready"]
+            },
+            "description": "Readiness: ping Postgres + RabbitMQ.\n\n**200** — deps ok\n```json\n{\"status\":\"ok\",\"checks\":{\"postgres\":\"ok\",\"rabbitmq\":\"ok\"}}\n```\n\n**503** — algum check fail (`status: not_ready`)."
+          },
+          "response": [
+            {
+              "name": "OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/ready",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["ready"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"status\": \"ok\",\n  \"checks\": {\n    \"postgres\": \"ok\",\n    \"rabbitmq\": \"ok\"\n  }\n}"
+            },
+            {
+              "name": "Not Ready (postgres fail)",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/ready",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["ready"]
+                }
+              },
+              "status": "Service Unavailable",
+              "code": 503,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"status\": \"not_ready\",\n  \"checks\": {\n    \"postgres\": \"fail\",\n    \"rabbitmq\": \"ok\"\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET Health (worker metrics)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{metricsUrl}}/health",
+              "host": ["{{metricsUrl}}"],
+              "path": ["health"]
+            },
+            "description": "Liveness do worker no `METRICS_ADDR` (`:9091`). Sempre `200` `{\"status\":\"ok\"}`."
+          },
+          "response": [
+            {
+              "name": "OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{metricsUrl}}/health",
+                  "host": ["{{metricsUrl}}"],
+                  "path": ["health"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"status\": \"ok\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET Ready (worker metrics)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{metricsUrl}}/ready",
+              "host": ["{{metricsUrl}}"],
+              "path": ["ready"]
+            },
+            "description": "Readiness do worker (`METRICS_ADDR`): mesmos checks Postgres + RabbitMQ. `200` / `503` como na API."
+          },
+          "response": [
+            {
+              "name": "OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{metricsUrl}}/ready",
+                  "host": ["{{metricsUrl}}"],
+                  "path": ["ready"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"status\": \"ok\",\n  \"checks\": {\n    \"postgres\": \"ok\",\n    \"rabbitmq\": \"ok\"\n  }\n}"
             }
           ]
         }
@@ -257,7 +394,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["images", "{{imageId}}"]
             },
-            "description": "Apaga original, variantes no disco e rows no Postgres.\n\n**204** — removido\n**404** — id inexistente"
+            "description": "Apaga original, variantes no MinIO e rows no Postgres.\n\n**204** — removido\n**404** — id inexistente"
           },
           "response": [
             {

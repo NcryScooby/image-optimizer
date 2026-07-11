@@ -18,7 +18,28 @@ A API fica em `http://localhost:8080`. Serviços: `api`, `worker`, `postgres`, `
 | Prometheus | [http://localhost:9090](http://localhost:9090) |
 | Grafana | [http://localhost:3000](http://localhost:3000) (anônimo Viewer; admin `admin`/`admin`) |
 
-Storage S3/MinIO: [`docs/minio.md`](docs/minio.md). Grafana: [`docs/grafana.md`](docs/grafana.md).
+Storage S3/MinIO: [`docs/minio.md`](docs/minio.md). Grafana: [`docs/grafana.md`](docs/grafana.md). Readiness (`/health` + `/ready`): [`docs/readiness.md`](docs/readiness.md).
+
+## Health e readiness
+
+| Endpoint | Onde | Comportamento |
+| --- | --- | --- |
+| `GET /health` | API `:8080`, worker metrics `:9091` | Liveness: sempre `200` `{"status":"ok"}` (sem tocar deps) |
+| `GET /ready` | API `:8080`, worker metrics `:9091` | Readiness: ping Postgres + RabbitMQ → `200` se ok, `503` se algum fail |
+
+Compose usa `/ready` como healthcheck de `api` e `worker` (só ficam healthy com deps up). Detalhes: [`docs/readiness.md`](docs/readiness.md).
+
+### Smoke readiness (manual)
+
+```bash
+docker compose up --build
+curl -s localhost:8080/health   # 200
+curl -s localhost:8080/ready    # 200 + checks ok
+curl -s localhost:9091/ready    # 200
+docker compose stop postgres
+curl -s localhost:8080/ready    # 503; /health ainda 200
+docker compose start postgres   # /ready volta a 200
+```
 
 ## Variáveis de ambiente
 
@@ -34,7 +55,7 @@ Storage S3/MinIO: [`docs/minio.md`](docs/minio.md). Grafana: [`docs/grafana.md`]
 | `S3_SECRET_KEY` | *(obrigatório)* | Secret key MinIO/S3 |
 | `S3_USE_PATH_STYLE` | `false` | `true` para MinIO (path-style) |
 | `HTTP_ADDR` | `:8080` | Endereço HTTP do `serve` (inclui `GET /metrics`) |
-| `METRICS_ADDR` | *(vazio = off)* | Endereço `/metrics` do worker (Compose: `:9091`) |
+| `METRICS_ADDR` | *(vazio = off)* | Endereço `/metrics`, `/health`, `/ready` do worker (Compose: `:9091`) |
 | `MAX_UPLOAD_BYTES` | `10485760` | Limite de upload (10MB) |
 | `RETRY_AFTER_SECONDS` | `2` | Header `Retry-After` em respostas `202` |
 | `DEFAULT_QUALITY` | `80` | Qualidade AVIF padrão |
@@ -86,10 +107,13 @@ histogram_quantile(0.99, sum(rate(image_optimizer_worker_job_duration_seconds_bu
 
 ## Exemplos curl
 
-### Health
+### Health / ready
 
 ```bash
 curl -s http://localhost:8080/health
+curl -s http://localhost:8080/ready
+curl -s http://localhost:9091/health
+curl -s http://localhost:9091/ready
 ```
 
 ### Upload

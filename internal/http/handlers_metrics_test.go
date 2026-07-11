@@ -29,6 +29,7 @@ type mockStore struct {
 	upsertCreated  bool
 	upsertErr      error
 	deletePendingN int
+	pingErr        error
 }
 
 func (m *mockStore) InsertImage(context.Context, uuid.UUID, string, string, int64) (db.Image, error) {
@@ -60,9 +61,12 @@ func (m *mockStore) DeletePendingVariant(context.Context, uuid.UUID) error {
 	return nil
 }
 
+func (m *mockStore) Ping(context.Context) error { return m.pingErr }
+
 type mockQueue struct {
 	err       error
 	published []string
+	pingErr   error
 }
 
 func (m *mockQueue) Publish(_ context.Context, variantID string) error {
@@ -72,6 +76,8 @@ func (m *mockQueue) Publish(_ context.Context, variantID string) error {
 	m.published = append(m.published, variantID)
 	return nil
 }
+
+func (m *mockQueue) Ping(context.Context) error { return m.pingErr }
 
 type mockBlob struct {
 	getPath string

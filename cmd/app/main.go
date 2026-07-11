@@ -146,6 +146,12 @@ func runWorker() error {
 	if cfg.MetricsAddr != "" {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
+		mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		})
+		mux.HandleFunc("/ready", apihttp.ReadyHandler(store, q))
 		metricsSrv = &http.Server{
 			Addr:              cfg.MetricsAddr,
 			Handler:           mux,

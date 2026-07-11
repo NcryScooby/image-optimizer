@@ -31,6 +31,10 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (h *Handler) handleReady(w http.ResponseWriter, r *http.Request) {
+	ReadyHandler(h.store, h.queue)(w, r)
+}
+
 func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// Cap body to max upload + small multipart overhead.
 	maxBody := h.cfg.MaxUploadBytes + 64<<10
