@@ -1,0 +1,285 @@
+{
+  "info": {
+    "_postman_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "name": "Image Optimizer",
+    "description": "API Go híbrida: upload → disco/Postgres → variantes AVIF sob demanda (worker + imgproxy + RabbitMQ).\n\n**Fluxo típico**\n1. `POST /images` → guarda `id`\n2. `GET /images/:id` com params → `202` + `Retry-After` enquanto processa\n3. Repetir GET até `200` (`Content-Type: image/avif`)\n4. `DELETE /images/:id` quando não precisar mais\n\n**Formatos de upload:** JPEG, PNG, WebP · **Max:** 10MB\n\n**Query GET:** `w`, `h`, `crop` (center|top|bottom|left|right), `q` (1–100, default 80), `fit` (cover|contain|fill)",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "imageId",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "GET Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["health"]
+            },
+            "description": "Liveness. Resposta `200`:\n```json\n{\"status\":\"ok\"}\n```"
+          },
+          "response": [
+            {
+              "name": "OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/health",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["health"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"status\": \"ok\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Images",
+      "item": [
+        {
+          "name": "POST Upload",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "    const body = pm.response.json();",
+                  "    if (body.id) {",
+                  "        pm.collectionVariables.set('imageId', body.id);",
+                  "    }",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": [],
+                  "description": "Campo obrigatório. JPEG, PNG ou WebP · máx. 10MB"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/images",
+              "host": ["{{baseUrl}}"],
+              "path": ["images"]
+            },
+            "description": "Upload multipart. Campo `file`.\n\n**201** — salva `id` na variável de collection `imageId`.\n```json\n{\"id\":\"<uuid>\",\"content_type\":\"image/jpeg\",\"size\":12345}\n```\n\n**400** — form inválido / tipo não suportado / arquivo vazio\n**413** — excede `MAX_UPLOAD_BYTES`"
+          },
+          "response": [
+            {
+              "name": "Created",
+              "originalRequest": {
+                "method": "POST",
+                "header": [],
+                "body": {
+                  "mode": "formdata",
+                  "formdata": [
+                    {
+                      "key": "file",
+                      "type": "file",
+                      "src": []
+                    }
+                  ]
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/images",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["images"]
+                }
+              },
+              "status": "Created",
+              "code": 201,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"id\": \"550e8400-e29b-41d4-a716-446655440000\",\n  \"content_type\": \"image/jpeg\",\n  \"size\": 12345\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET Variant (com params)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/images/{{imageId}}?w=300&h=200&fit=cover&crop=center&q=80",
+              "host": ["{{baseUrl}}"],
+              "path": ["images", "{{imageId}}"],
+              "query": [
+                {
+                  "key": "w",
+                  "value": "300",
+                  "description": "Width (int > 0)"
+                },
+                {
+                  "key": "h",
+                  "value": "200",
+                  "description": "Height (int > 0)"
+                },
+                {
+                  "key": "fit",
+                  "value": "cover",
+                  "description": "cover | contain | fill"
+                },
+                {
+                  "key": "crop",
+                  "value": "center",
+                  "description": "center | top | bottom | left | right"
+                },
+                {
+                  "key": "q",
+                  "value": "80",
+                  "description": "Quality 1–100 (default 80)"
+                }
+              ]
+            },
+            "description": "Serve variante AVIF sob demanda.\n\n| Situação | HTTP | Notas |\n| --- | --- | --- |\n| Pronta | `200` | body = bytes AVIF, `Content-Type: image/avif` |\n| Pendente / 1ª vez | `202` | header `Retry-After` (segundos) — poll de novo |\n| Failed (retries esgotados) | `422` | JSON erro |\n| Imagem inexistente | `404` | |\n| Params inválidos | `400` | |\n\nMesmo GET durante `pending` → `202` **sem** republicar job."
+          },
+          "response": [
+            {
+              "name": "Accepted (pending)",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/images/{{imageId}}?w=300&h=200&fit=cover&q=80",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["images", "{{imageId}}"],
+                  "query": [
+                    { "key": "w", "value": "300" },
+                    { "key": "h", "value": "200" },
+                    { "key": "fit", "value": "cover" },
+                    { "key": "q", "value": "80" }
+                  ]
+                }
+              },
+              "status": "Accepted",
+              "code": 202,
+              "_postman_previewlanguage": "text",
+              "header": [
+                {
+                  "key": "Retry-After",
+                  "value": "2"
+                }
+              ],
+              "body": ""
+            },
+            {
+              "name": "OK (AVIF)",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/images/{{imageId}}?w=300&h=200&fit=cover&q=80",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["images", "{{imageId}}"],
+                  "query": [
+                    { "key": "w", "value": "300" },
+                    { "key": "h", "value": "200" },
+                    { "key": "fit", "value": "cover" },
+                    { "key": "q", "value": "80" }
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "text",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "image/avif"
+                }
+              ],
+              "body": "(binary AVIF)"
+            }
+          ]
+        },
+        {
+          "name": "GET Variant (full-size / identity)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/images/{{imageId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["images", "{{imageId}}"]
+            },
+            "description": "Sem query params → variante identity: AVIF full-size com quality default (80).\n\nMesmo contrato de status: `202` → poll → `200`."
+          },
+          "response": []
+        },
+        {
+          "name": "DELETE Image",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/images/{{imageId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["images", "{{imageId}}"]
+            },
+            "description": "Apaga original, variantes no disco e rows no Postgres.\n\n**204** — removido\n**404** — id inexistente"
+          },
+          "response": [
+            {
+              "name": "No Content",
+              "originalRequest": {
+                "method": "DELETE",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/images/{{imageId}}",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["images", "{{imageId}}"]
+                }
+              },
+              "status": "No Content",
+              "code": 204,
+              "_postman_previewlanguage": "text",
+              "header": [],
+              "body": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

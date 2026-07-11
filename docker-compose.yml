@@ -1,0 +1,84 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: imageopt
+      POSTGRES_PASSWORD: imageopt
+      POSTGRES_DB: imageopt
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U imageopt -d imageopt"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+
+  imgproxy:
+    image: darthsim/imgproxy:v3.25.0
+    environment:
+      IMGPROXY_LOCAL_FILESYSTEM_ROOT: /data
+      IMGPROXY_USE_ETAG: "true"
+      # Unsigned URLs on the internal Docker network only (no public port).
+      IMGPROXY_KEY: ""
+      IMGPROXY_SALT: ""
+    volumes:
+      - ./data:/data
+    # No ports: reachable only as http://imgproxy:8080 on the compose network.
+
+  api:
+    build: .
+    command: ["serve"]
+    restart: on-failure
+    ports:
+      - "8080:8080"
+    environment: &app_env
+      DATABASE_URL: postgres://imageopt:imageopt@postgres:5432/imageopt?sslmode=disable
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      IMGPROXY_URL: http://imgproxy:8080
+      DATA_DIR: /data
+      HTTP_ADDR: ":8080"
+      MAX_UPLOAD_BYTES: "10485760"
+      RETRY_AFTER_SECONDS: "2"
+      DEFAULT_QUALITY: "80"
+    volumes:
+      - ./data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      imgproxy:
+        condition: service_started
+
+  worker:
+    build: .
+    command: ["worker"]
+    restart: on-failure
+    environment:
+      <<: *app_env
+    volumes:
+      - ./data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      imgproxy:
+        condition: service_started
+
+volumes:
+  postgres_data:
