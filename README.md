@@ -8,9 +8,11 @@ API Go híbrida: upload de imagens → disco + Postgres → variantes AVIF sob d
 docker compose up --build
 ```
 
-A API fica em `http://localhost:8080`. Serviços: `api`, `worker`, `postgres`, `rabbitmq`, `imgproxy` (só rede interna), `prometheus`.
+A API fica em `http://localhost:8080`. Serviços: `api`, `worker`, `postgres`, `rabbitmq`, `imgproxy` (só rede interna), `prometheus`, `grafana`.
 
 Prometheus UI: [http://localhost:9090](http://localhost:9090).
+
+Grafana: [http://localhost:3000](http://localhost:3000) (anônimo Viewer; admin `admin`/`admin`) — guia em [`docs/grafana.md`](docs/grafana.md).
 
 ## Variáveis de ambiente
 
@@ -26,7 +28,7 @@ Prometheus UI: [http://localhost:9090](http://localhost:9090).
 | `RETRY_AFTER_SECONDS` | `2` | Header `Retry-After` em respostas `202` |
 | `DEFAULT_QUALITY` | `80` | Qualidade AVIF padrão |
 
-## Observabilidade (Prometheus)
+## Observabilidade (Prometheus + Grafana)
 
 Métricas em texto Prometheus:
 
@@ -34,6 +36,8 @@ Métricas em texto Prometheus:
 - Worker: `http://localhost:9091/metrics`
 
 Config de scrape: [`deploy/prometheus.yml`](deploy/prometheus.yml) (jobs `api` → `api:8080`, `worker` → `worker:9091`).
+
+Dashboard Grafana (Compose): [http://localhost:3000](http://localhost:3000) — [`docs/grafana.md`](docs/grafana.md).
 
 ### PromQL de exemplo
 
