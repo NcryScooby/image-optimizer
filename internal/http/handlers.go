@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/notrealscooby/image-optimizer/internal/db"
+	"github.com/notrealscooby/image-optimizer/internal/metrics"
 	"github.com/notrealscooby/image-optimizer/internal/transform"
 )
 
@@ -139,9 +140,11 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 		// Race: another request may have finished (or failed) before upsert returned.
 		switch variant.Status {
 		case db.StatusReady:
+			metrics.CacheHitsTotal.Inc()
 			h.serveVariant(w, r, variant)
 			return
 		case db.StatusFailed:
+			metrics.CacheFailedTotal.Inc()
 			h.writeFailed(w, variant)
 			return
 		case db.StatusPending:
@@ -156,6 +159,12 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 					writeError(w, http.StatusServiceUnavailable, "failed to enqueue variant")
 					return
 				}
+				// Cold miss: first creation + successful publish.
+				metrics.CacheMissesTotal.Inc()
+				metrics.JobsEnqueuedTotal.Inc()
+			} else {
+				// Concurrent upsert lost the insert — treat as pending poll.
+				metrics.CachePendingTotal.Inc()
 			}
 			h.writeAccepted(w)
 			return
@@ -167,11 +176,14 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	switch variant.Status {
 	case db.StatusReady:
+		metrics.CacheHitsTotal.Inc()
 		h.serveVariant(w, r, variant)
 	case db.StatusPending:
 		// Already queued — do not republish.
+		metrics.CachePendingTotal.Inc()
 		h.writeAccepted(w)
 	case db.StatusFailed:
+		metrics.CacheFailedTotal.Inc()
 		h.writeFailed(w, variant)
 	default:
 		writeError(w, http.StatusInternalServerError, "unknown variant status")

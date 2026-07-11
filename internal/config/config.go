@@ -13,6 +13,7 @@ type Config struct {
 	ImgproxyURL       string
 	DataDir           string
 	HTTPAddr          string
+	MetricsAddr       string
 	MaxUploadBytes    int64
 	RetryAfterSeconds int
 	DefaultQuality    int
@@ -35,6 +36,7 @@ func Load() (Config, error) {
 		ImgproxyURL:       os.Getenv("IMGPROXY_URL"),
 		DataDir:           getenv("DATA_DIR", defaultDataDir),
 		HTTPAddr:          getenv("HTTP_ADDR", defaultHTTPAddr),
+		MetricsAddr:       os.Getenv("METRICS_ADDR"), // empty default = metrics off
 		MaxUploadBytes:    defaultMaxUploadBytes,
 		RetryAfterSeconds: defaultRetryAfterSeconds,
 		DefaultQuality:    defaultDefaultQuality,

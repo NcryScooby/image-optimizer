@@ -54,6 +54,18 @@ func Connect(url string) (*Client, error) {
 	return &Client{conn: conn, ch: ch}, nil
 }
 
+// QueueInspect returns the approximate number of ready messages in image.variants.
+func (c *Client) QueueInspect() (int, error) {
+	if c == nil || c.ch == nil {
+		return 0, fmt.Errorf("queue: client not connected")
+	}
+	q, err := c.ch.QueueInspect(QueueName)
+	if err != nil {
+		return 0, fmt.Errorf("queue: inspect %s: %w", QueueName, err)
+	}
+	return q.Messages, nil
+}
+
 // Publish enqueues a variant processing job.
 func (c *Client) Publish(ctx context.Context, variantID string) error {
 	if c == nil || c.ch == nil {

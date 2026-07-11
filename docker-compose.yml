@@ -68,8 +68,11 @@ services:
     build: .
     command: ["worker"]
     restart: on-failure
+    ports:
+      - "9091:9091"
     environment:
       <<: *app_env
+      METRICS_ADDR: ":9091"
     volumes:
       - ./data:/data
     depends_on:
@@ -79,6 +82,20 @@ services:
         condition: service_healthy
       imgproxy:
         condition: service_started
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    depends_on:
+      - api
+      - worker
 
 volumes:
   postgres_data:

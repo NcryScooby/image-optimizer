@@ -6,13 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/notrealscooby/image-optimizer/internal/db"
 	"github.com/notrealscooby/image-optimizer/internal/imgproxy"
+	"github.com/notrealscooby/image-optimizer/internal/metrics"
 	"github.com/notrealscooby/image-optimizer/internal/queue"
-	"github.com/notrealscooby/image-optimizer/internal/storage"
 	"github.com/notrealscooby/image-optimizer/internal/transform"
 )
 
@@ -22,12 +23,39 @@ const maxAttempts = 3
 
 const defaultQuality = 80
 
-// Deps are the collaborators Run needs. Wired by cmd/worker in Wave 3.
+const queueDepthInterval = 10 * time.Second
+
+// variantStore is the DB surface the worker needs.
+type variantStore interface {
+	GetVariantByID(ctx context.Context, id uuid.UUID) (db.Variant, error)
+	GetImage(ctx context.Context, id uuid.UUID) (db.Image, error)
+	IncrAttempts(ctx context.Context, id uuid.UUID) (int, error)
+	MarkFailed(ctx context.Context, id uuid.UUID, lastError string) error
+	MarkReady(ctx context.Context, id uuid.UUID, path string) error
+}
+
+// imgproxyFetcher fetches transformed image bytes.
+type imgproxyFetcher interface {
+	Fetch(ctx context.Context, path string) ([]byte, error)
+}
+
+// variantWriter persists AVIF variant bytes to disk.
+type variantWriter interface {
+	WriteVariant(ctx context.Context, imageID, paramsHash string, data []byte) (string, error)
+}
+
+// jobQueue consumes jobs and reports queue depth.
+type jobQueue interface {
+	Consume(ctx context.Context, handler queue.Handler) error
+	QueueInspect() (int, error)
+}
+
+// Deps are the collaborators Run needs. Wired by cmd/app.
 type Deps struct {
-	DB       *db.Store
-	Storage  *storage.Storage
-	Imgproxy *imgproxy.Client
-	Queue    *queue.Client
+	DB       variantStore
+	Storage  variantWriter
+	Imgproxy imgproxyFetcher
+	Queue    jobQueue
 }
 
 // Run consumes image.variants until ctx is cancelled.
@@ -38,10 +66,44 @@ func Run(ctx context.Context, deps Deps) error {
 		return fmt.Errorf("worker: incomplete deps")
 	}
 	slog.Info("worker started")
+	go deps.pollQueueDepth(ctx)
 	return deps.Queue.Consume(ctx, deps.process)
 }
 
-func (d Deps) process(ctx context.Context, variantID string) error {
+func (d Deps) pollQueueDepth(ctx context.Context) {
+	d.updateQueueDepth()
+	ticker := time.NewTicker(queueDepthInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.updateQueueDepth()
+		}
+	}
+}
+
+func (d Deps) updateQueueDepth() {
+	n, err := d.Queue.QueueInspect()
+	if err != nil {
+		slog.Warn("worker: queue inspect failed", "err", err)
+		return
+	}
+	metrics.QueueDepth.Set(float64(n))
+}
+
+func (d Deps) process(ctx context.Context, variantID string) (err error) {
+	start := time.Now()
+	var result string
+	defer func() {
+		if result == "" {
+			return
+		}
+		metrics.JobsProcessedTotal.WithLabelValues(result).Inc()
+		metrics.WorkerJobDurationSeconds.WithLabelValues(result).Observe(time.Since(start).Seconds())
+	}()
+
 	id, err := uuid.Parse(variantID)
 	if err != nil {
 		slog.Error("worker: invalid variant_id", "variant_id", variantID, "err", err)
@@ -54,6 +116,7 @@ func (d Deps) process(ctx context.Context, variantID string) error {
 			slog.Warn("worker: variant not found", "variant_id", variantID)
 			return nil
 		}
+		result = metrics.ResultRequeued
 		return fmt.Errorf("get variant: %w", err)
 	}
 
@@ -65,6 +128,7 @@ func (d Deps) process(ctx context.Context, variantID string) error {
 
 	attempts, err := d.DB.IncrAttempts(ctx, id)
 	if err != nil {
+		result = metrics.ResultRequeued
 		return fmt.Errorf("incr attempts: %w", err)
 	}
 
@@ -76,14 +140,18 @@ func (d Deps) process(ctx context.Context, variantID string) error {
 		)
 		if attempts >= maxAttempts {
 			if markErr := d.DB.MarkFailed(ctx, id, truncateErr(err, 500)); markErr != nil {
+				result = metrics.ResultRequeued
 				return fmt.Errorf("mark failed: %w", markErr)
 			}
+			result = metrics.ResultFailed
 			return nil // ack — retries exhausted
 		}
+		result = metrics.ResultRequeued
 		return err // nack + requeue
 	}
 
 	slog.Info("worker: variant ready", "variant_id", variantID, "attempts", attempts)
+	result = metrics.ResultSuccess
 	return nil
 }
 
@@ -99,12 +167,17 @@ func (d Deps) transformAndPersist(ctx context.Context, v db.Variant) error {
 	}
 
 	path := imgproxy.BuildPath(img.OriginalPath, params)
+
+	fetchStart := time.Now()
 	data, err := d.Imgproxy.Fetch(ctx, path)
+	metrics.WorkerImgproxyFetchDurationSeconds.Observe(time.Since(fetchStart).Seconds())
 	if err != nil {
 		return fmt.Errorf("imgproxy fetch: %w", err)
 	}
 
+	writeStart := time.Now()
 	rel, err := d.Storage.WriteVariant(ctx, v.ImageID.String(), v.ParamsHash, data)
+	metrics.WorkerDiskWriteDurationSeconds.Observe(time.Since(writeStart).Seconds())
 	if err != nil {
 		return fmt.Errorf("write variant: %w", err)
 	}

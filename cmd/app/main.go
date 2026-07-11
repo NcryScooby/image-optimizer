@@ -14,9 +14,12 @@ import (
 	"github.com/notrealscooby/image-optimizer/internal/db"
 	apihttp "github.com/notrealscooby/image-optimizer/internal/http"
 	"github.com/notrealscooby/image-optimizer/internal/imgproxy"
+	_ "github.com/notrealscooby/image-optimizer/internal/metrics" // register Prometheus metrics
 	"github.com/notrealscooby/image-optimizer/internal/queue"
 	"github.com/notrealscooby/image-optimizer/internal/storage"
 	"github.com/notrealscooby/image-optimizer/internal/worker"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -139,12 +142,38 @@ func runWorker() error {
 
 	img := imgproxy.New(cfg.ImgproxyURL)
 
+	var metricsSrv *http.Server
+	if cfg.MetricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		metricsSrv = &http.Server{
+			Addr:              cfg.MetricsAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			slog.Info("metrics listening", "addr", cfg.MetricsAddr)
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("metrics server failed", "err", err)
+			}
+		}()
+	}
+
 	err = worker.Run(ctx, worker.Deps{
 		DB:       store,
 		Storage:  stor,
 		Imgproxy: img,
 		Queue:    q,
 	})
+
+	if metricsSrv != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if shutErr := metricsSrv.Shutdown(shutdownCtx); shutErr != nil {
+			slog.Error("metrics server shutdown", "err", shutErr)
+		}
+	}
+
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
