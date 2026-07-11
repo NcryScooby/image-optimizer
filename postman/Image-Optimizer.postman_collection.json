@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     "name": "Image Optimizer",
-    "description": "API Go híbrida: upload → MinIO/Postgres → variantes AVIF sob demanda (worker + imgproxy + RabbitMQ).\n\n**Fluxo típico**\n1. `POST /images` → guarda `id`\n2. `GET /images/:id` com params → `202` + `Retry-After` enquanto processa\n3. Repetir GET até `200` (`Content-Type: image/avif`)\n4. `DELETE /images/:id` quando não precisar mais\n\n**Health:** `GET /health` = liveness; `GET /ready` = Postgres + RabbitMQ (API `:8080`, worker metrics `:9091`). Ver `docs/readiness.md`.\n\n**Formatos de upload:** JPEG, PNG, WebP · **Max:** 10MB\n\n**Query GET:** `w`, `h`, `crop` (center|top|bottom|left|right), `q` (1–100, default 80), `fit` (cover|contain|fill)",
+    "description": "API Go híbrida: upload → MinIO/Postgres → variantes AVIF sob demanda (worker + imgproxy + RabbitMQ).\n\n**Fluxo típico**\n1. `POST /images` → guarda `id`\n2. `HEAD` ou `GET /images/:id` com params → `202` + `Retry-After` enquanto processa\n3. Poll com `HEAD` (sem baixar bytes) até `200`, depois `GET` para o AVIF\n4. `DELETE /images/:id` quando não precisar mais\n\n**HEAD vs GET:** mesmos query params e status (`200`/`202`/`422`/`400`/`404`). HEAD nunca devolve body (nem erro JSON) e no `ready` não toca S3.\n\n**Health:** `GET /health` = liveness; `GET /ready` = Postgres + RabbitMQ (API `:8080`, worker metrics `:9091`). Ver `docs/readiness.md`.\n\n**Formatos de upload:** JPEG, PNG, WebP · **Max:** 10MB\n\n**Query GET/HEAD:** `w`, `h`, `crop` (center|top|bottom|left|right), `q` (1–100, default 80), `fit` (cover|contain|fill)",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -309,7 +309,7 @@
                 }
               ]
             },
-            "description": "Serve variante AVIF sob demanda.\n\n| Situação | HTTP | Notas |\n| --- | --- | --- |\n| Pronta | `200` | body = bytes AVIF, `Content-Type: image/avif` |\n| Pendente / 1ª vez | `202` | header `Retry-After` (segundos) — poll de novo |\n| Failed (retries esgotados) | `422` | JSON erro |\n| Imagem inexistente | `404` | |\n| Params inválidos | `400` | |\n\nMesmo GET durante `pending` → `202` **sem** republicar job."
+            "description": "Serve variante AVIF sob demanda.\n\n| Situação | HTTP | Notas |\n| --- | --- | --- |\n| Pronta | `200` | body = bytes AVIF, `Content-Type: image/avif` |\n| Pendente / 1ª vez | `202` | header `Retry-After` (segundos) — poll de novo |\n| Failed (retries esgotados) | `422` | JSON erro |\n| Imagem inexistente | `404` | |\n| Params inválidos | `400` | |\n\nMesmo GET durante `pending` → `202` **sem** republicar job. Para poll sem baixar AVIF, usar `HEAD Variant`."
           },
           "response": [
             {
@@ -371,6 +371,104 @@
           ]
         },
         {
+          "name": "HEAD Variant (status sem body)",
+          "request": {
+            "method": "HEAD",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/images/{{imageId}}?w=300&h=200&fit=cover&crop=center&q=80",
+              "host": ["{{baseUrl}}"],
+              "path": ["images", "{{imageId}}"],
+              "query": [
+                {
+                  "key": "w",
+                  "value": "300",
+                  "description": "Width (int > 0)"
+                },
+                {
+                  "key": "h",
+                  "value": "200",
+                  "description": "Height (int > 0)"
+                },
+                {
+                  "key": "fit",
+                  "value": "cover",
+                  "description": "cover | contain | fill"
+                },
+                {
+                  "key": "crop",
+                  "value": "center",
+                  "description": "center | top | bottom | left | right"
+                },
+                {
+                  "key": "q",
+                  "value": "80",
+                  "description": "Quality 1–100 (default 80)"
+                }
+              ]
+            },
+            "description": "Inspeciona status da variante **sem** transferir bytes. Mesmos params e side effects do GET (miss cria `pending` + enfileira job).\n\n| Situação | HTTP | Headers | Body |\n| --- | --- | --- | --- |\n| Pronta | `200` | `Content-Type: image/avif` | vazio (sem `Content-Length`, sem S3) |\n| Pendente / 1ª vez | `202` | `Retry-After` | vazio |\n| Failed | `422` | `Content-Type: application/json` | vazio |\n| Imagem inexistente | `404` | | vazio |\n| Params inválidos | `400` | | vazio |\n\nUso: poll leve (`Send and Download` desnecessário) antes do GET que baixa o AVIF."
+          },
+          "response": [
+            {
+              "name": "Accepted (pending)",
+              "originalRequest": {
+                "method": "HEAD",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/images/{{imageId}}?w=300&h=200&fit=cover&q=80",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["images", "{{imageId}}"],
+                  "query": [
+                    { "key": "w", "value": "300" },
+                    { "key": "h", "value": "200" },
+                    { "key": "fit", "value": "cover" },
+                    { "key": "q", "value": "80" }
+                  ]
+                }
+              },
+              "status": "Accepted",
+              "code": 202,
+              "_postman_previewlanguage": "text",
+              "header": [
+                {
+                  "key": "Retry-After",
+                  "value": "2"
+                }
+              ],
+              "body": ""
+            },
+            {
+              "name": "OK (ready, no body)",
+              "originalRequest": {
+                "method": "HEAD",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/images/{{imageId}}?w=300&h=200&fit=cover&q=80",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["images", "{{imageId}}"],
+                  "query": [
+                    { "key": "w", "value": "300" },
+                    { "key": "h", "value": "200" },
+                    { "key": "fit", "value": "cover" },
+                    { "key": "q", "value": "80" }
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "text",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "image/avif"
+                }
+              ],
+              "body": ""
+            }
+          ]
+        },
+        {
           "name": "GET Variant (full-size / identity)",
           "request": {
             "method": "GET",
@@ -380,10 +478,11 @@
               "host": ["{{baseUrl}}"],
               "path": ["images", "{{imageId}}"]
             },
-            "description": "Sem query params → variante identity: AVIF full-size com quality default (80).\n\nMesmo contrato de status: `202` → poll → `200`."
+            "description": "Sem query params → variante identity: AVIF full-size com quality default (80).\n\nMesmo contrato de status: `202` → poll → `200`. Preferir `HEAD` para poll sem baixar bytes."
           },
           "response": []
         },
+
         {
           "name": "DELETE Image",
           "request": {

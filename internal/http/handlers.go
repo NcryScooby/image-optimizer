@@ -1,11 +1,13 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -16,6 +18,25 @@ import (
 	"github.com/notrealscooby/image-optimizer/internal/metrics"
 	"github.com/notrealscooby/image-optimizer/internal/transform"
 )
+
+type variantOutcome int
+
+const (
+	outcomeReady variantOutcome = iota
+	outcomePending
+	outcomeFailed
+	outcomeBadRequest
+	outcomeNotFound
+	outcomeUnavailable // publish fail → 503
+	outcomeInternal
+)
+
+type resolveResult struct {
+	outcome  variantOutcome
+	variant  db.Variant
+	errMsg   string // for writeError / logs
+	enqueued bool   // created+Publish OK → miss metric + jobs_enqueued
+}
 
 type uploadResponse struct {
 	ID          string `json:"id"`
@@ -100,96 +121,135 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
+func (h *Handler) resolveVariant(ctx context.Context, idStr string, query url.Values) resolveResult {
+	id, err := uuid.Parse(idStr)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid image id")
-		return
+		return resolveResult{outcome: outcomeBadRequest, errMsg: "invalid image id"}
 	}
 
-	params, err := transform.Parse(r.URL.Query())
+	params, err := transform.Parse(query)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+		return resolveResult{outcome: outcomeBadRequest, errMsg: err.Error()}
 	}
 	paramsHash := transform.Hash(params)
 	paramsJSON := transform.CacheKeyJSON(params)
 
-	if _, err := h.store.GetImage(r.Context(), id); err != nil {
+	if _, err := h.store.GetImage(ctx, id); err != nil {
 		if errors.Is(err, db.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "image not found")
-			return
+			return resolveResult{outcome: outcomeNotFound, errMsg: "image not found"}
 		}
 		h.log.Error("get image", "err", err, "id", id)
-		writeError(w, http.StatusInternalServerError, "failed to load image")
-		return
+		return resolveResult{outcome: outcomeInternal, errMsg: "failed to load image"}
 	}
 
-	variant, err := h.store.GetVariantByHash(r.Context(), id, paramsHash)
+	variant, err := h.store.GetVariantByHash(ctx, id, paramsHash)
 	if err != nil && !errors.Is(err, db.ErrNotFound) {
 		h.log.Error("get variant", "err", err, "image_id", id)
-		writeError(w, http.StatusInternalServerError, "failed to load variant")
-		return
+		return resolveResult{outcome: outcomeInternal, errMsg: "failed to load variant"}
 	}
 
 	if errors.Is(err, db.ErrNotFound) {
 		var created bool
-		variant, created, err = h.store.UpsertPendingVariant(r.Context(), id, paramsHash, paramsJSON)
+		variant, created, err = h.store.UpsertPendingVariant(ctx, id, paramsHash, paramsJSON)
 		if err != nil {
 			h.log.Error("upsert pending variant", "err", err, "image_id", id)
-			writeError(w, http.StatusInternalServerError, "failed to enqueue variant")
-			return
+			return resolveResult{outcome: outcomeInternal, errMsg: "failed to enqueue variant"}
 		}
 		// Race: another request may have finished (or failed) before upsert returned.
 		switch variant.Status {
 		case db.StatusReady:
-			metrics.CacheHitsTotal.Inc()
-			h.serveVariant(w, r, variant)
-			return
+			return resolveResult{outcome: outcomeReady, variant: variant}
 		case db.StatusFailed:
-			metrics.CacheFailedTotal.Inc()
-			h.writeFailed(w, variant)
-			return
+			return resolveResult{outcome: outcomeFailed, variant: variant}
 		case db.StatusPending:
 			// Publish only when this request created the row (no duplicate jobs).
 			if created {
-				if err := h.queue.Publish(r.Context(), variant.ID.String()); err != nil {
+				if err := h.queue.Publish(ctx, variant.ID.String()); err != nil {
 					h.log.Error("publish variant job", "err", err, "variant_id", variant.ID)
-					// Drop orphan pending so next GET can UpsertPending+Publish.
-					if delErr := h.store.DeletePendingVariant(r.Context(), variant.ID); delErr != nil {
+					// Drop orphan pending so next request can UpsertPending+Publish.
+					if delErr := h.store.DeletePendingVariant(ctx, variant.ID); delErr != nil {
 						h.log.Error("delete pending after publish fail", "err", delErr, "variant_id", variant.ID)
 					}
-					writeError(w, http.StatusServiceUnavailable, "failed to enqueue variant")
-					return
+					return resolveResult{outcome: outcomeUnavailable, errMsg: "failed to enqueue variant"}
 				}
 				// Cold miss: first creation + successful publish.
-				metrics.CacheMissesTotal.Inc()
-				metrics.JobsEnqueuedTotal.Inc()
-			} else {
-				// Concurrent upsert lost the insert — treat as pending poll.
-				metrics.CachePendingTotal.Inc()
+				return resolveResult{outcome: outcomePending, variant: variant, enqueued: true}
 			}
-			h.writeAccepted(w)
-			return
+			// Concurrent upsert lost the insert — treat as pending poll.
+			return resolveResult{outcome: outcomePending, variant: variant}
 		default:
-			writeError(w, http.StatusInternalServerError, "unknown variant status")
-			return
+			return resolveResult{outcome: outcomeInternal, errMsg: "unknown variant status"}
 		}
 	}
 
 	switch variant.Status {
 	case db.StatusReady:
-		metrics.CacheHitsTotal.Inc()
-		h.serveVariant(w, r, variant)
+		return resolveResult{outcome: outcomeReady, variant: variant}
 	case db.StatusPending:
 		// Already queued — do not republish.
-		metrics.CachePendingTotal.Inc()
-		h.writeAccepted(w)
+		return resolveResult{outcome: outcomePending, variant: variant}
 	case db.StatusFailed:
-		metrics.CacheFailedTotal.Inc()
-		h.writeFailed(w, variant)
+		return resolveResult{outcome: outcomeFailed, variant: variant}
 	default:
-		writeError(w, http.StatusInternalServerError, "unknown variant status")
+		return resolveResult{outcome: outcomeInternal, errMsg: "unknown variant status"}
+	}
+}
+
+func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
+	res := h.resolveVariant(r.Context(), chi.URLParam(r, "id"), r.URL.Query())
+	switch res.outcome {
+	case outcomeReady:
+		metrics.CacheHitsTotal.Inc()
+		h.serveVariant(w, r, res.variant)
+	case outcomePending:
+		if res.enqueued {
+			metrics.CacheMissesTotal.Inc()
+			metrics.JobsEnqueuedTotal.Inc()
+		} else {
+			metrics.CachePendingTotal.Inc()
+		}
+		h.writeAccepted(w)
+	case outcomeFailed:
+		metrics.CacheFailedTotal.Inc()
+		h.writeFailed(w, res.variant)
+	case outcomeBadRequest:
+		writeError(w, http.StatusBadRequest, res.errMsg)
+	case outcomeNotFound:
+		writeError(w, http.StatusNotFound, res.errMsg)
+	case outcomeUnavailable:
+		writeError(w, http.StatusServiceUnavailable, res.errMsg)
+	case outcomeInternal:
+		writeError(w, http.StatusInternalServerError, res.errMsg)
+	}
+}
+
+func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request) {
+	res := h.resolveVariant(r.Context(), chi.URLParam(r, "id"), r.URL.Query())
+	switch res.outcome {
+	case outcomeReady:
+		metrics.CacheHeadHitsTotal.Inc()
+		w.Header().Set("Content-Type", "image/avif")
+		w.WriteHeader(http.StatusOK)
+	case outcomePending:
+		if res.enqueued {
+			metrics.CacheHeadMissesTotal.Inc()
+			metrics.JobsEnqueuedTotal.Inc()
+		} else {
+			metrics.CacheHeadPendingTotal.Inc()
+		}
+		h.writeAccepted(w)
+	case outcomeFailed:
+		metrics.CacheHeadFailedTotal.Inc()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	case outcomeBadRequest:
+		w.WriteHeader(http.StatusBadRequest)
+	case outcomeNotFound:
+		w.WriteHeader(http.StatusNotFound)
+	case outcomeUnavailable:
+		w.WriteHeader(http.StatusServiceUnavailable)
+	case outcomeInternal:
+		w.WriteHeader(http.StatusInternalServerError)
 	}
 }
 

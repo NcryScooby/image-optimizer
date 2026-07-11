@@ -80,7 +80,8 @@ func (m *mockQueue) Publish(_ context.Context, variantID string) error {
 func (m *mockQueue) Ping(context.Context) error { return m.pingErr }
 
 type mockBlob struct {
-	getPath string
+	getPath  string
+	getCalls int
 }
 
 func (m *mockBlob) SaveOriginal(context.Context, string, string, []byte) (string, error) {
@@ -90,6 +91,7 @@ func (m *mockBlob) DeleteImageFiles(context.Context, string, string) error {
 	return errors.New("not implemented")
 }
 func (m *mockBlob) Get(_ context.Context, _ string) (io.ReadCloser, int64, error) {
+	m.getCalls++
 	if m.getPath == "" {
 		return nil, 0, errors.New("no file")
 	}
@@ -106,26 +108,35 @@ func (m *mockBlob) Get(_ context.Context, _ string) (io.ReadCloser, int64, error
 }
 
 type counterSnap struct {
-	hits, misses, pending, failed, enqueued float64
+	hits, misses, pending, failed, enqueued       float64
+	headHits, headMisses, headPending, headFailed float64
 }
 
 func snapCounters() counterSnap {
 	return counterSnap{
-		hits:     testutil.ToFloat64(metrics.CacheHitsTotal),
-		misses:   testutil.ToFloat64(metrics.CacheMissesTotal),
-		pending:  testutil.ToFloat64(metrics.CachePendingTotal),
-		failed:   testutil.ToFloat64(metrics.CacheFailedTotal),
-		enqueued: testutil.ToFloat64(metrics.JobsEnqueuedTotal),
+		hits:        testutil.ToFloat64(metrics.CacheHitsTotal),
+		misses:      testutil.ToFloat64(metrics.CacheMissesTotal),
+		pending:     testutil.ToFloat64(metrics.CachePendingTotal),
+		failed:      testutil.ToFloat64(metrics.CacheFailedTotal),
+		enqueued:    testutil.ToFloat64(metrics.JobsEnqueuedTotal),
+		headHits:    testutil.ToFloat64(metrics.CacheHeadHitsTotal),
+		headMisses:  testutil.ToFloat64(metrics.CacheHeadMissesTotal),
+		headPending: testutil.ToFloat64(metrics.CacheHeadPendingTotal),
+		headFailed:  testutil.ToFloat64(metrics.CacheHeadFailedTotal),
 	}
 }
 
 func (c counterSnap) delta(after counterSnap) counterSnap {
 	return counterSnap{
-		hits:     after.hits - c.hits,
-		misses:   after.misses - c.misses,
-		pending:  after.pending - c.pending,
-		failed:   after.failed - c.failed,
-		enqueued: after.enqueued - c.enqueued,
+		hits:        after.hits - c.hits,
+		misses:      after.misses - c.misses,
+		pending:     after.pending - c.pending,
+		failed:      after.failed - c.failed,
+		enqueued:    after.enqueued - c.enqueued,
+		headHits:    after.headHits - c.headHits,
+		headMisses:  after.headMisses - c.headMisses,
+		headPending: after.headPending - c.headPending,
+		headFailed:  after.headFailed - c.headFailed,
 	}
 }
 
@@ -147,6 +158,26 @@ func doGet(t *testing.T, h *Handler, imageID uuid.UUID) *http.Response {
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 	rr := httptest.NewRecorder()
 	h.handleGet(rr, req)
+	return rr.Result()
+}
+
+func doHead(t *testing.T, h *Handler, imageID uuid.UUID) *http.Response {
+	t.Helper()
+	return doHeadRaw(t, h, imageID.String(), "w=100")
+}
+
+func doHeadRaw(t *testing.T, h *Handler, idParam, rawQuery string) *http.Response {
+	t.Helper()
+	u := "/images/" + idParam
+	if rawQuery != "" {
+		u += "?" + rawQuery
+	}
+	req := httptest.NewRequest(http.MethodHead, u, nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", idParam)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+	h.handleHead(rr, req)
 	return rr.Result()
 }
 

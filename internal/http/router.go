@@ -76,6 +76,7 @@ func NewRouter(h *Handler) http.Handler {
 	r.Route("/images", func(r chi.Router) {
 		r.Post("/", h.handleUpload)
 		r.Get("/{id}", h.handleGet)
+		r.Head("/{id}", h.handleHead)
 		r.Delete("/{id}", h.handleDelete)
 	})
 

@@ -73,9 +73,18 @@ Config de scrape: [`deploy/prometheus.yml`](deploy/prometheus.yml) (jobs `api` �
 
 Dashboard Grafana (Compose): [http://localhost:3000](http://localhost:3000) — [`docs/grafana.md`](docs/grafana.md).
 
+### Métricas de cache (GET vs HEAD)
+
+| Métrica | Método |
+| --- | --- |
+| `image_optimizer_cache_{hits,misses,pending,failed}_total` | GET |
+| `image_optimizer_cache_head_{hits,misses,pending,failed}_total` | HEAD |
+
+`image_optimizer_jobs_enqueued_total` é compartilhado por GET e HEAD (cold miss que enfileira job).
+
 ### PromQL de exemplo
 
-Hit rate (cache):
+Hit rate (cache GET):
 
 ```promql
 sum(rate(image_optimizer_cache_hits_total[5m]))
@@ -150,6 +159,23 @@ Sem params → reencode AVIF full-size (quality default):
 
 ```bash
 curl -s -o full.avif -w "%{http_code}\n" "http://localhost:8080/images/${ID}"
+```
+
+### HEAD (poll 202 → 200 sem baixar AVIF)
+
+Mesmos query params do GET; só headers (status / `Content-Type` / `Retry-After`), sem body:
+
+```bash
+ID=<uuid>
+curl -sI "http://localhost:8080/images/${ID}?w=300&h=200&fit=cover&q=80"
+```
+
+Repita até `HTTP/1.1 200` (sem baixar o AVIF):
+
+```bash
+until curl -sI "http://localhost:8080/images/${ID}?w=300&h=200&fit=cover&q=80" | head -n1 | grep -q ' 200'; do
+  sleep 2
+done
 ```
 
 ### Delete

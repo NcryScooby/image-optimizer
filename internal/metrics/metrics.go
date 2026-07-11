@@ -36,6 +36,26 @@ var (
 		Name:      "cache_failed_total",
 		Help:      "GET requests that found a failed variant",
 	})
+	CacheHeadHitsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "cache_head_hits_total",
+		Help:      "HEAD requests that served a ready variant",
+	})
+	CacheHeadMissesTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "cache_head_misses_total",
+		Help:      "Cold cache misses that upserted a variant and published a job",
+	})
+	CacheHeadPendingTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "cache_head_pending_total",
+		Help:      "HEAD polls that found a pending variant",
+	})
+	CacheHeadFailedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "cache_head_failed_total",
+		Help:      "HEAD requests that found a failed variant",
+	})
 	JobsEnqueuedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Name:      "jobs_enqueued_total",
@@ -76,6 +96,10 @@ func init() {
 		CacheMissesTotal,
 		CachePendingTotal,
 		CacheFailedTotal,
+		CacheHeadHitsTotal,
+		CacheHeadMissesTotal,
+		CacheHeadPendingTotal,
+		CacheHeadFailedTotal,
 		JobsEnqueuedTotal,
 		QueueDepth,
 		JobsProcessedTotal,
