@@ -20,3 +20,5 @@ coverage.out
 .vscode/
 *.swp
 .DS_Store
+
+/docs/
