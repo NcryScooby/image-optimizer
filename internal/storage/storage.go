@@ -1,50 +1,75 @@
 package storage
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
+	"io"
+	"path"
 	"strings"
+
+	"github.com/notrealscooby/image-optimizer/internal/config"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
-// Storage manages original images and AVIF variants on disk under DATA_DIR.
+// Storage manages original images and AVIF variants in an S3-compatible bucket.
 //
-// Layout:
+// Layout (object keys):
 //
-//	{root}/originals/{id}.{ext}
-//	{root}/variants/{id}/{params_hash}.avif
+//	originals/{id}.{ext}
+//	variants/{id}/{params_hash}.avif
 type Storage struct {
-	root string
+	client *s3.Client
+	bucket string
 }
 
-// New creates a Storage rooted at dataDir (typically DATA_DIR, default /data).
-// It ensures originals/ and variants/ directories exist.
-func New(dataDir string) (*Storage, error) {
-	if dataDir == "" {
-		return nil, fmt.Errorf("storage: dataDir is required")
+// New creates an S3 Storage client (path-style when configured) and ensures the bucket exists.
+func New(ctx context.Context, cfg config.Config) (*Storage, error) {
+	if cfg.S3Endpoint == "" || cfg.S3Region == "" || cfg.S3Bucket == "" {
+		return nil, fmt.Errorf("storage: S3 endpoint, region, and bucket are required")
 	}
-	abs, err := filepath.Abs(dataDir)
+	if cfg.S3AccessKey == "" || cfg.S3SecretKey == "" {
+		return nil, fmt.Errorf("storage: S3 access key and secret key are required")
+	}
+
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion(cfg.S3Region),
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+			cfg.S3AccessKey,
+			cfg.S3SecretKey,
+			"",
+		)),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("storage: resolve dataDir: %w", err)
+		return nil, fmt.Errorf("storage: load aws config: %w", err)
 	}
-	s := &Storage{root: abs}
-	if err := os.MkdirAll(s.originalsDir(), 0o755); err != nil {
-		return nil, fmt.Errorf("storage: create originals dir: %w", err)
-	}
-	if err := os.MkdirAll(s.variantsDir(), 0o755); err != nil {
-		return nil, fmt.Errorf("storage: create variants dir: %w", err)
+
+	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(cfg.S3Endpoint)
+		o.UsePathStyle = cfg.S3UsePathStyle
+	})
+
+	s := &Storage{client: client, bucket: cfg.S3Bucket}
+	if err := s.ensureBucket(ctx); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
 
-// Root returns the absolute DATA_DIR path.
-func (s *Storage) Root() string {
-	return s.root
+// Bucket returns the configured S3 bucket name.
+func (s *Storage) Bucket() string {
+	return s.bucket
 }
 
 // SaveOriginal writes the original image to originals/{id}.{ext}.
-// Returns a path relative to DATA_DIR (e.g. "originals/{id}.{ext}").
+// Returns a relative object key (e.g. "originals/{id}.{ext}").
 func (s *Storage) SaveOriginal(ctx context.Context, id, ext string, data []byte) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -57,28 +82,21 @@ func (s *Storage) SaveOriginal(ctx context.Context, id, ext string, data []byte)
 		return "", err
 	}
 
-	rel := filepath.Join("originals", id+"."+ext)
-	abs, err := s.safeJoin(rel)
-	if err != nil {
-		return "", err
+	key := path.Join("originals", id+"."+ext)
+	if err := s.putObject(ctx, key, data); err != nil {
+		return "", fmt.Errorf("storage: put original: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
-		return "", fmt.Errorf("storage: mkdir originals: %w", err)
-	}
-	if err := writeFileAtomic(abs, data, 0o644); err != nil {
-		return "", fmt.Errorf("storage: write original: %w", err)
-	}
-	return filepath.ToSlash(rel), nil
+	return key, nil
 }
 
-// VariantPath returns the relative path for a variant:
+// VariantPath returns the relative key for a variant:
 // variants/{imageID}/{paramsHash}.avif
 func (s *Storage) VariantPath(imageID, paramsHash string) string {
-	return filepath.ToSlash(filepath.Join("variants", imageID, paramsHash+".avif"))
+	return path.Join("variants", imageID, paramsHash+".avif")
 }
 
 // WriteVariant writes AVIF bytes to variants/{imageID}/{paramsHash}.avif.
-// Returns a path relative to DATA_DIR.
+// Returns a relative object key.
 func (s *Storage) WriteVariant(ctx context.Context, imageID, paramsHash string, data []byte) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -90,22 +108,15 @@ func (s *Storage) WriteVariant(ctx context.Context, imageID, paramsHash string, 
 		return "", err
 	}
 
-	rel := s.VariantPath(imageID, paramsHash)
-	abs, err := s.safeJoin(rel)
-	if err != nil {
-		return "", err
+	key := s.VariantPath(imageID, paramsHash)
+	if err := s.putObject(ctx, key, data); err != nil {
+		return "", fmt.Errorf("storage: put variant: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
-		return "", fmt.Errorf("storage: mkdir variants: %w", err)
-	}
-	if err := writeFileAtomic(abs, data, 0o644); err != nil {
-		return "", fmt.Errorf("storage: write variant: %w", err)
-	}
-	return filepath.ToSlash(rel), nil
+	return key, nil
 }
 
-// DeleteImageFiles removes the original file and the entire variants/{imageID}/ directory.
-// originalPath may be relative to DATA_DIR or absolute under DATA_DIR.
+// DeleteImageFiles removes the original object and all objects under variants/{imageID}/.
+// originalPath is a relative object key (e.g. "originals/{id}.ext").
 func (s *Storage) DeleteImageFiles(ctx context.Context, imageID, originalPath string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -117,101 +128,158 @@ func (s *Storage) DeleteImageFiles(ctx context.Context, imageID, originalPath st
 	var firstErr error
 
 	if originalPath != "" {
-		abs, err := s.resolveUnderRoot(originalPath)
+		key, err := normalizeKey(originalPath)
 		if err != nil {
 			firstErr = err
-		} else if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
-			firstErr = fmt.Errorf("storage: remove original: %w", err)
+		} else if err := s.deleteObject(ctx, key); err != nil {
+			firstErr = fmt.Errorf("storage: delete original: %w", err)
 		}
 	}
 
-	variantsAbs, err := s.safeJoin(filepath.Join("variants", imageID))
-	if err != nil {
-		return err
-	}
-	if err := os.RemoveAll(variantsAbs); err != nil {
+	prefix := path.Join("variants", imageID) + "/"
+	if err := s.deletePrefix(ctx, prefix); err != nil {
 		if firstErr == nil {
-			return fmt.Errorf("storage: remove variants: %w", err)
+			return fmt.Errorf("storage: delete variants: %w", err)
 		}
-		return fmt.Errorf("storage: remove variants: %w (also: %v)", err, firstErr)
+		return fmt.Errorf("storage: delete variants: %w (also: %v)", err, firstErr)
 	}
 	return firstErr
 }
 
-// AbsPath resolves a relative path under DATA_DIR to an absolute path.
-// Rejects path traversal outside the root.
-func (s *Storage) AbsPath(rel string) (string, error) {
-	return s.safeJoin(rel)
-}
-
-// ReadFile reads a file by relative or absolute path under DATA_DIR.
-func (s *Storage) ReadFile(ctx context.Context, path string) ([]byte, error) {
+// Get fetches an object by relative key. Caller must Close the returned body.
+// Size is the object ContentLength when known; -1 if unknown.
+func (s *Storage) Get(ctx context.Context, relPath string) (io.ReadCloser, int64, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	abs, err := s.resolveUnderRoot(path)
+	key, err := normalizeKey(relPath)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	data, err := os.ReadFile(abs)
+
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
 	if err != nil {
-		return nil, fmt.Errorf("storage: read file: %w", err)
+		return nil, 0, fmt.Errorf("storage: get object %q: %w", key, err)
 	}
-	return data, nil
+
+	size := int64(-1)
+	if out.ContentLength != nil {
+		size = *out.ContentLength
+	}
+	return out.Body, size, nil
 }
 
-// Open opens a file by relative or absolute path under DATA_DIR for streaming.
-// Caller must Close the returned file.
-func (s *Storage) Open(path string) (*os.File, error) {
-	abs, err := s.resolveUnderRoot(path)
-	if err != nil {
-		return nil, err
+func (s *Storage) ensureBucket(ctx context.Context) error {
+	_, err := s.client.HeadBucket(ctx, &s3.HeadBucketInput{
+		Bucket: aws.String(s.bucket),
+	})
+	if err == nil {
+		return nil
 	}
-	f, err := os.Open(abs)
-	if err != nil {
-		return nil, fmt.Errorf("storage: open file: %w", err)
+	if !isNotFound(err) {
+		return fmt.Errorf("storage: head bucket %q: %w", s.bucket, err)
 	}
-	return f, nil
+
+	_, err = s.client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String(s.bucket),
+	})
+	if err != nil {
+		var exists *types.BucketAlreadyOwnedByYou
+		var exists2 *types.BucketAlreadyExists
+		if errors.As(err, &exists) || errors.As(err, &exists2) {
+			return nil
+		}
+		return fmt.Errorf("storage: create bucket %q: %w", s.bucket, err)
+	}
+	return nil
 }
 
-func (s *Storage) originalsDir() string {
-	return filepath.Join(s.root, "originals")
+func (s *Storage) putObject(ctx context.Context, key string, data []byte) error {
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(data),
+	})
+	return err
 }
 
-func (s *Storage) variantsDir() string {
-	return filepath.Join(s.root, "variants")
+func (s *Storage) deleteObject(ctx context.Context, key string) error {
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	return err
 }
 
-// safeJoin joins rel to root and ensures the result stays under root.
-func (s *Storage) safeJoin(rel string) (string, error) {
-	rel = filepath.Clean("/" + filepath.ToSlash(rel))
-	rel = strings.TrimPrefix(rel, "/")
-	if rel == "" || rel == "." {
+func (s *Storage) deletePrefix(ctx context.Context, prefix string) error {
+	var token *string
+	for {
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return err
+		}
+		if len(out.Contents) == 0 {
+			if out.IsTruncated != nil && *out.IsTruncated && out.NextContinuationToken != nil {
+				token = out.NextContinuationToken
+				continue
+			}
+			return nil
+		}
+
+		objs := make([]types.ObjectIdentifier, 0, len(out.Contents))
+		for _, obj := range out.Contents {
+			if obj.Key == nil || *obj.Key == "" {
+				continue
+			}
+			objs = append(objs, types.ObjectIdentifier{Key: obj.Key})
+		}
+		if len(objs) > 0 {
+			_, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				Bucket: aws.String(s.bucket),
+				Delete: &types.Delete{
+					Objects: objs,
+					Quiet:   aws.Bool(true),
+				},
+			})
+			if err != nil {
+				return err
+			}
+		}
+
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			return nil
+		}
+		token = out.NextContinuationToken
+	}
+}
+
+func normalizeKey(relPath string) (string, error) {
+	key := strings.TrimPrefix(path.Clean("/"+strings.ReplaceAll(relPath, "\\", "/")), "/")
+	if key == "" || key == "." {
 		return "", fmt.Errorf("storage: empty path")
 	}
-	abs := filepath.Join(s.root, rel)
-	return s.ensureUnderRoot(abs)
+	if strings.HasPrefix(key, "..") || strings.Contains(key, "/../") {
+		return "", fmt.Errorf("storage: path escapes bucket")
+	}
+	return key, nil
 }
 
-// resolveUnderRoot accepts a relative path or an absolute path already under root.
-func (s *Storage) resolveUnderRoot(path string) (string, error) {
-	if path == "" {
-		return "", fmt.Errorf("storage: empty path")
+func isNotFound(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NotFound", "NoSuchBucket", "404":
+			return true
+		}
 	}
-	if filepath.IsAbs(path) {
-		return s.ensureUnderRoot(filepath.Clean(path))
-	}
-	return s.safeJoin(path)
-}
-
-func (s *Storage) ensureUnderRoot(abs string) (string, error) {
-	abs = filepath.Clean(abs)
-	root := s.root
-	sep := string(os.PathSeparator)
-	if abs != root && !strings.HasPrefix(abs, root+sep) {
-		return "", fmt.Errorf("storage: path escapes data dir")
-	}
-	return abs, nil
+	return false
 }
 
 func validateID(id string) error {
@@ -261,36 +329,4 @@ func sanitizeExt(ext string) (string, error) {
 		return "", fmt.Errorf("storage: invalid ext")
 	}
 	return ext, nil
-}
-
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	cleanup = false
-	return nil
 }

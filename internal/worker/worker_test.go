@@ -162,7 +162,7 @@ func TestProcess_Success_RecordsMetrics(t *testing.T) {
 	beforeFetch := histogramSampleCount(t, metrics.WorkerImgproxyFetchDurationSeconds)
 	beforeWrite := histogramSampleCount(t, metrics.WorkerDiskWriteDurationSeconds)
 
-	deps := Deps{DB: store, Storage: stor, Imgproxy: img, Queue: &mockQueue{}}
+	deps := Deps{DB: store, Storage: stor, Imgproxy: img, Queue: &mockQueue{}, S3Bucket: "images"}
 	err := deps.process(context.Background(), v.ID.String())
 	if err != nil {
 		t.Fatalf("process: %v", err)
@@ -208,7 +208,7 @@ func TestProcess_Failed_AfterMaxAttempts(t *testing.T) {
 	beforeRequeued := counterValue(t, metrics.ResultRequeued)
 	beforeJobHist := histogramSampleCount(t, metrics.WorkerJobDurationSeconds.WithLabelValues(metrics.ResultFailed))
 
-	deps := Deps{DB: store, Storage: &mockStorage{}, Imgproxy: img, Queue: &mockQueue{}}
+	deps := Deps{DB: store, Storage: &mockStorage{}, Imgproxy: img, Queue: &mockQueue{}, S3Bucket: "images"}
 	err := deps.process(context.Background(), v.ID.String())
 	if err != nil {
 		t.Fatalf("process: expected nil (ack), got %v", err)
@@ -245,7 +245,7 @@ func TestProcess_Requeued_OnTransientFailure(t *testing.T) {
 	beforeSuccess := counterValue(t, metrics.ResultSuccess)
 	beforeJobHist := histogramSampleCount(t, metrics.WorkerJobDurationSeconds.WithLabelValues(metrics.ResultRequeued))
 
-	deps := Deps{DB: store, Storage: &mockStorage{}, Imgproxy: img, Queue: &mockQueue{}}
+	deps := Deps{DB: store, Storage: &mockStorage{}, Imgproxy: img, Queue: &mockQueue{}, S3Bucket: "images"}
 	err := deps.process(context.Background(), v.ID.String())
 	if err == nil {
 		t.Fatal("expected error for nack+requeue")
@@ -277,7 +277,7 @@ func TestProcess_SkipTerminal_NoMetrics(t *testing.T) {
 	beforeFailed := counterValue(t, metrics.ResultFailed)
 	beforeRequeued := counterValue(t, metrics.ResultRequeued)
 
-	deps := Deps{DB: store, Storage: &mockStorage{}, Imgproxy: &mockImgproxy{}, Queue: &mockQueue{}}
+	deps := Deps{DB: store, Storage: &mockStorage{}, Imgproxy: &mockImgproxy{}, Queue: &mockQueue{}, S3Bucket: "images"}
 	err := deps.process(context.Background(), v.ID.String())
 	if err != nil {
 		t.Fatalf("process: %v", err)

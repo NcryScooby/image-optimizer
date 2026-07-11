@@ -74,7 +74,7 @@ func (m *mockQueue) Publish(_ context.Context, variantID string) error {
 }
 
 type mockBlob struct {
-	openPath string
+	getPath string
 }
 
 func (m *mockBlob) SaveOriginal(context.Context, string, string, []byte) (string, error) {
@@ -83,11 +83,20 @@ func (m *mockBlob) SaveOriginal(context.Context, string, string, []byte) (string
 func (m *mockBlob) DeleteImageFiles(context.Context, string, string) error {
 	return errors.New("not implemented")
 }
-func (m *mockBlob) Open(path string) (*os.File, error) {
-	if m.openPath == "" {
-		return nil, errors.New("no file")
+func (m *mockBlob) Get(_ context.Context, _ string) (io.ReadCloser, int64, error) {
+	if m.getPath == "" {
+		return nil, 0, errors.New("no file")
 	}
-	return os.Open(m.openPath)
+	f, err := os.Open(m.getPath)
+	if err != nil {
+		return nil, 0, err
+	}
+	stat, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, 0, err
+	}
+	return f, stat.Size(), nil
 }
 
 type counterSnap struct {
@@ -166,7 +175,7 @@ func TestHandleGet_CacheMetrics(t *testing.T) {
 					image:      db.Image{ID: imageID},
 					variant:    db.Variant{ID: variantID, Status: db.StatusReady, Path: &relPath},
 					variantErr: nil,
-				}, q, &mockBlob{openPath: path})
+				}, q, &mockBlob{getPath: path})
 				return h, q
 			},
 			wantStatus: http.StatusOK,
@@ -234,7 +243,7 @@ func TestHandleGet_CacheMetrics(t *testing.T) {
 					variantErr:    db.ErrNotFound,
 					upsertVariant: db.Variant{ID: variantID, Status: db.StatusReady, Path: &relPath},
 					upsertCreated: false,
-				}, q, &mockBlob{openPath: path})
+				}, q, &mockBlob{getPath: path})
 				return h, q
 			},
 			wantStatus: http.StatusOK,

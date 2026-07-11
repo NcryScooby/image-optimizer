@@ -56,6 +56,7 @@ type Deps struct {
 	Storage  variantWriter
 	Imgproxy imgproxyFetcher
 	Queue    jobQueue
+	S3Bucket string
 }
 
 // Run consumes image.variants until ctx is cancelled.
@@ -166,7 +167,7 @@ func (d Deps) transformAndPersist(ctx context.Context, v db.Variant) error {
 		return err
 	}
 
-	path := imgproxy.BuildPath(img.OriginalPath, params)
+	path := imgproxy.BuildPath(d.S3Bucket, img.OriginalPath, params)
 
 	fetchStart := time.Now()
 	data, err := d.Imgproxy.Fetch(ctx, path)

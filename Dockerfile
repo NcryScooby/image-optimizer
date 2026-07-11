@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.23-alpine AS builder
+FROM golang:1.24-alpine AS builder
 WORKDIR /src
 
 RUN apk add --no-cache ca-certificates git
@@ -17,8 +17,6 @@ WORKDIR /app
 
 COPY --from=builder /out/app /app/app
 COPY migrations /app/migrations
-
-RUN mkdir -p /data
 
 EXPOSE 8080
 ENTRYPOINT ["/app/app"]

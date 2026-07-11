@@ -2,9 +2,9 @@ package http
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
-	"os"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -33,11 +33,11 @@ type jobQueue interface {
 	Publish(ctx context.Context, variantID string) error
 }
 
-// blobStore reads and writes image files on disk.
+// blobStore reads and writes image blobs (S3/MinIO).
 type blobStore interface {
 	SaveOriginal(ctx context.Context, id, ext string, data []byte) (string, error)
 	DeleteImageFiles(ctx context.Context, imageID, originalPath string) error
-	Open(path string) (*os.File, error)
+	Get(ctx context.Context, path string) (io.ReadCloser, int64, error)
 }
 
 // Handler holds dependencies for image API endpoints.

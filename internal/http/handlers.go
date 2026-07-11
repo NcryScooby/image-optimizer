@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
 
@@ -234,23 +233,22 @@ func (h *Handler) serveVariant(w http.ResponseWriter, r *http.Request, v db.Vari
 		return
 	}
 
-	f, err := h.storage.Open(*v.Path)
+	body, size, err := h.storage.Get(r.Context(), *v.Path)
 	if err != nil {
-		h.log.Error("open variant", "err", err, "path", *v.Path)
+		h.log.Error("get variant", "err", err, "path", *v.Path)
 		writeError(w, http.StatusInternalServerError, "failed to open variant")
 		return
 	}
-	defer f.Close()
-
-	stat, err := f.Stat()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to stat variant")
-		return
-	}
+	defer body.Close()
 
 	w.Header().Set("Content-Type", "image/avif")
-	w.Header().Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
-	http.ServeContent(w, r, path.Base(*v.Path), stat.ModTime(), f)
+	if size >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	}
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.Copy(w, body); err != nil {
+		h.log.Error("copy variant", "err", err, "path", *v.Path)
+	}
 }
 
 func (h *Handler) writeAccepted(w http.ResponseWriter) {

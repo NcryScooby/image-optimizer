@@ -8,11 +8,10 @@ import (
 	"github.com/notrealscooby/image-optimizer/internal/transform"
 )
 
-// BuildPath builds an unsigned imgproxy request path for an original under
-// IMGPROXY_LOCAL_FILESYSTEM_ROOT (e.g. originals/{id}.jpg → local:///originals/...).
+// BuildPath builds an unsigned imgproxy request path for an original in S3/MinIO.
 //
-// Format: /insecure/rs:{fit}:{w}:{h}/g:{crop}/q:{q}/plain/local:///{path}@avif
-func BuildPath(originalPath string, p transform.Params) string {
+// Format: /insecure/rs:{fit}:{w}:{h}/g:{crop}/q:{q}/plain/s3://{bucket}/{key}@avif
+func BuildPath(bucket, originalPath string, p transform.Params) string {
 	w, h := 0, 0
 	if p.W != nil {
 		w = *p.W
@@ -27,12 +26,12 @@ func BuildPath(originalPath string, p transform.Params) string {
 		fmt.Sprintf("g:%s", gravity(p.Crop)),
 		fmt.Sprintf("q:%d", p.Q),
 		"plain",
-		fmt.Sprintf("local:///%s@avif", localPath(originalPath)),
+		fmt.Sprintf("s3://%s/%s@avif", bucket, objectKey(originalPath)),
 	}
 	return "/" + strings.Join(segments, "/")
 }
 
-func localPath(originalPath string) string {
+func objectKey(originalPath string) string {
 	p := path.Clean("/" + strings.TrimSpace(originalPath))
 	return strings.TrimPrefix(p, "/")
 }

@@ -68,7 +68,7 @@ func runServe() error {
 
 	store := db.NewStore(pool)
 
-	stor, err := storage.New(cfg.DataDir)
+	stor, err := storage.New(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -129,7 +129,7 @@ func runWorker() error {
 
 	store := db.NewStore(pool)
 
-	stor, err := storage.New(cfg.DataDir)
+	stor, err := storage.New(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -164,6 +164,7 @@ func runWorker() error {
 		Storage:  stor,
 		Imgproxy: img,
 		Queue:    q,
+		S3Bucket: cfg.S3Bucket,
 	})
 
 	if metricsSrv != nil {
