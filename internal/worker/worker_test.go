@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
@@ -203,6 +204,14 @@ func TestProcess_Failed_AfterMaxAttempts(t *testing.T) {
 	}
 	img := &mockImgproxy{err: errors.New("imgproxy down")}
 
+	var waitCalls int
+	orig := waitBackoffFn
+	waitBackoffFn = func(ctx context.Context, attempts int) error {
+		waitCalls++
+		return nil
+	}
+	t.Cleanup(func() { waitBackoffFn = orig })
+
 	beforeFailed := counterValue(t, metrics.ResultFailed)
 	beforeSuccess := counterValue(t, metrics.ResultSuccess)
 	beforeRequeued := counterValue(t, metrics.ResultRequeued)
@@ -215,6 +224,9 @@ func TestProcess_Failed_AfterMaxAttempts(t *testing.T) {
 	}
 	if !store.failedMarked {
 		t.Fatal("expected MarkFailed")
+	}
+	if waitCalls != 0 {
+		t.Fatalf("MarkFailed path must not wait backoff: calls=%d", waitCalls)
 	}
 
 	if got := counterValue(t, metrics.ResultFailed) - beforeFailed; got != 1 {
@@ -240,6 +252,15 @@ func TestProcess_Requeued_OnTransientFailure(t *testing.T) {
 	}
 	img := &mockImgproxy{err: errors.New("transient")}
 
+	var waitCalls, waitAttempts int
+	orig := waitBackoffFn
+	waitBackoffFn = func(ctx context.Context, attempts int) error {
+		waitCalls++
+		waitAttempts = attempts
+		return nil // no-op: avoid 1s sleep in CI
+	}
+	t.Cleanup(func() { waitBackoffFn = orig })
+
 	beforeRequeued := counterValue(t, metrics.ResultRequeued)
 	beforeFailed := counterValue(t, metrics.ResultFailed)
 	beforeSuccess := counterValue(t, metrics.ResultSuccess)
@@ -253,6 +274,12 @@ func TestProcess_Requeued_OnTransientFailure(t *testing.T) {
 	if store.failedMarked {
 		t.Fatal("should not MarkFailed before max attempts")
 	}
+	if waitCalls != 1 {
+		t.Fatalf("requeue path must wait backoff once: calls=%d", waitCalls)
+	}
+	if waitAttempts != 1 {
+		t.Fatalf("waitBackoff attempts: got %d want 1", waitAttempts)
+	}
 
 	if got := counterValue(t, metrics.ResultRequeued) - beforeRequeued; got != 1 {
 		t.Fatalf("requeued counter delta: got %v want 1", got)
@@ -265,6 +292,38 @@ func TestProcess_Requeued_OnTransientFailure(t *testing.T) {
 	}
 	if got := histogramSampleCount(t, metrics.WorkerJobDurationSeconds.WithLabelValues(metrics.ResultRequeued)) - beforeJobHist; got != 1 {
 		t.Fatalf("job duration requeued samples: got %d want 1", got)
+	}
+}
+
+func TestBackoffDuration(t *testing.T) {
+	cases := []struct {
+		attempts int
+		want     time.Duration
+	}{
+		{1, time.Second},
+		{2, 2 * time.Second},
+		{3, 4 * time.Second},
+	}
+	for _, tc := range cases {
+		if got := backoffDuration(tc.attempts); got != tc.want {
+			t.Errorf("backoffDuration(%d): got %v want %v", tc.attempts, got, tc.want)
+		}
+	}
+}
+
+func TestWaitBackoff_Cancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	err := waitBackoff(ctx, 1)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitBackoff: got %v want context.Canceled", err)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("cancelled wait should return early, took %v", elapsed)
 	}
 }
 

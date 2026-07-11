@@ -25,6 +25,9 @@ const defaultQuality = 80
 
 const queueDepthInterval = 10 * time.Second
 
+// waitBackoffFn is the requeue delay hook; overridden in tests.
+var waitBackoffFn = waitBackoff
+
 // variantStore is the DB surface the worker needs.
 type variantStore interface {
 	GetVariantByID(ctx context.Context, id uuid.UUID) (db.Variant, error)
@@ -148,6 +151,9 @@ func (d Deps) process(ctx context.Context, variantID string) (err error) {
 			return nil // ack — retries exhausted
 		}
 		result = metrics.ResultRequeued
+		if waitErr := waitBackoffFn(ctx, attempts); waitErr != nil {
+			return waitErr // shutdown: still nack+requeue
+		}
 		return err // nack + requeue
 	}
 

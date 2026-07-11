@@ -18,7 +18,9 @@ A API fica em `http://localhost:8080`. Serviços: `api`, `worker`, `postgres`, `
 | Prometheus | [http://localhost:9090](http://localhost:9090) |
 | Grafana | [http://localhost:3000](http://localhost:3000) (anônimo Viewer; admin `admin`/`admin`) |
 
-Storage S3/MinIO: [`docs/minio.md`](docs/minio.md). Grafana: [`docs/grafana.md`](docs/grafana.md). Readiness (`/health` + `/ready`): [`docs/readiness.md`](docs/readiness.md).
+Storage S3/MinIO: [`docs/minio.md`](docs/minio.md). Grafana: [`docs/grafana.md`](docs/grafana.md). Readiness (`/health` + `/ready`): [`docs/readiness.md`](docs/readiness.md). Retry backoff: [`docs/retry-backoff.md`](docs/retry-backoff.md).
+
+Worker retry: max 3 attempts; exponential delays 1s then 2s before requeue (no sleep on final `MarkFailed`).
 
 ## Health e readiness
 
