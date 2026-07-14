@@ -8,13 +8,16 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"github.com/notrealscooby/image-optimizer/internal/db"
+	"github.com/notrealscooby/image-optimizer/internal/folder"
 	"github.com/notrealscooby/image-optimizer/internal/metrics"
 	"github.com/notrealscooby/image-optimizer/internal/transform"
 )
@@ -23,19 +26,21 @@ type variantOutcome int
 
 const (
 	outcomeReady variantOutcome = iota
-	outcomePending
 	outcomeFailed
 	outcomeBadRequest
 	outcomeNotFound
-	outcomeUnavailable // publish fail → 503
+	outcomeUnavailable
 	outcomeInternal
 )
 
+const peerReadyPollInterval = 50 * time.Millisecond
+
 type resolveResult struct {
-	outcome  variantOutcome
-	variant  db.Variant
-	errMsg   string // for writeError / logs
-	enqueued bool   // created+Publish OK → miss metric + jobs_enqueued
+	outcome variantOutcome
+	variant db.Variant
+	errMsg  string
+	miss    bool
+	waited  bool
 }
 
 type uploadResponse struct {
@@ -57,7 +62,6 @@ func (h *Handler) handleReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
-	// Cap body to max upload + small multipart overhead.
 	maxBody := h.cfg.MaxUploadBytes + 64<<10
 	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
 
@@ -68,6 +72,13 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid multipart form")
+		return
+	}
+
+	folderRaw := r.FormValue("folder")
+	mediaFolder, err := folder.Validate(folderRaw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -99,7 +110,7 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := uuid.New()
-	relPath, err := h.storage.SaveOriginal(r.Context(), id.String(), ext, data)
+	relPath, err := h.storage.SaveOriginal(r.Context(), mediaFolder, id.String(), ext, data)
 	if err != nil {
 		h.log.Error("save original", "err", err)
 		writeError(w, http.StatusInternalServerError, "failed to store image")
@@ -119,6 +130,105 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		ContentType: img.ContentType,
 		Size:        img.SizeBytes,
 	})
+}
+
+func (h *Handler) handleCopy(w http.ResponseWriter, r *http.Request) {
+	sourceID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid image id")
+		return
+	}
+
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		if err := r.ParseForm(); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid form")
+			return
+		}
+	}
+
+	mediaFolder, err := folder.Validate(r.FormValue("folder"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	src, err := h.store.GetImage(r.Context(), sourceID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "image not found")
+			return
+		}
+		h.log.Error("get image for copy", "err", err, "id", sourceID)
+		writeError(w, http.StatusInternalServerError, "failed to load image")
+		return
+	}
+
+	rc, _, err := h.storage.Get(r.Context(), src.OriginalPath)
+	if err != nil {
+		h.log.Error("read original for copy", "err", err, "id", sourceID)
+		writeError(w, http.StatusInternalServerError, "failed to read original")
+		return
+	}
+	defer rc.Close()
+
+	data, err := io.ReadAll(io.LimitReader(rc, h.cfg.MaxUploadBytes+1))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read original")
+		return
+	}
+	if int64(len(data)) > h.cfg.MaxUploadBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "file exceeds MAX_UPLOAD_BYTES")
+		return
+	}
+	if len(data) == 0 {
+		writeError(w, http.StatusInternalServerError, "original file empty")
+		return
+	}
+
+	ext, err := extensionForOriginal(src.OriginalPath, src.ContentType)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	newID := uuid.New()
+	relPath, err := h.storage.SaveOriginal(r.Context(), mediaFolder, newID.String(), ext, data)
+	if err != nil {
+		h.log.Error("save copied original", "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to store image")
+		return
+	}
+
+	img, err := h.store.InsertImage(r.Context(), newID, relPath, src.ContentType, int64(len(data)))
+	if err != nil {
+		_ = h.storage.DeleteImageFiles(r.Context(), newID.String(), relPath)
+		h.log.Error("insert copied image", "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to persist image")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, uploadResponse{
+		ID:          img.ID.String(),
+		ContentType: img.ContentType,
+		Size:        img.SizeBytes,
+	})
+}
+
+func extensionForOriginal(originalPath, contentType string) (string, error) {
+	ext := strings.TrimPrefix(strings.ToLower(path.Ext(originalPath)), ".")
+	if ext != "" && !strings.ContainsAny(ext, `/\`) {
+		return ext, nil
+	}
+	switch strings.ToLower(contentType) {
+	case "image/jpeg", "image/jpg":
+		return "jpg", nil
+	case "image/png":
+		return "png", nil
+	case "image/webp":
+		return "webp", nil
+	default:
+		return "", fmt.Errorf("cannot determine original extension")
+	}
 }
 
 func (h *Handler) resolveVariant(ctx context.Context, idStr string, query url.Values) resolveResult {
@@ -153,30 +263,19 @@ func (h *Handler) resolveVariant(ctx context.Context, idStr string, query url.Va
 		variant, created, err = h.store.UpsertPendingVariant(ctx, id, paramsHash, paramsJSON)
 		if err != nil {
 			h.log.Error("upsert pending variant", "err", err, "image_id", id)
-			return resolveResult{outcome: outcomeInternal, errMsg: "failed to enqueue variant"}
+			return resolveResult{outcome: outcomeInternal, errMsg: "failed to prepare variant"}
 		}
-		// Race: another request may have finished (or failed) before upsert returned.
 		switch variant.Status {
 		case db.StatusReady:
 			return resolveResult{outcome: outcomeReady, variant: variant}
 		case db.StatusFailed:
 			return resolveResult{outcome: outcomeFailed, variant: variant}
 		case db.StatusPending:
-			// Publish only when this request created the row (no duplicate jobs).
 			if created {
-				if err := h.queue.Publish(ctx, variant.ID.String()); err != nil {
-					h.log.Error("publish variant job", "err", err, "variant_id", variant.ID)
-					// Drop orphan pending so next request can UpsertPending+Publish.
-					if delErr := h.store.DeletePendingVariant(ctx, variant.ID); delErr != nil {
-						h.log.Error("delete pending after publish fail", "err", delErr, "variant_id", variant.ID)
-					}
-					return resolveResult{outcome: outcomeUnavailable, errMsg: "failed to enqueue variant"}
-				}
-				// Cold miss: first creation + successful publish.
-				return resolveResult{outcome: outcomePending, variant: variant, enqueued: true}
+				h.publishBestEffort(ctx, variant.ID)
+				return h.syncGenerate(ctx, variant, true)
 			}
-			// Concurrent upsert lost the insert — treat as pending poll.
-			return resolveResult{outcome: outcomePending, variant: variant}
+			return h.waitOrSync(ctx, variant)
 		default:
 			return resolveResult{outcome: outcomeInternal, errMsg: "unknown variant status"}
 		}
@@ -186,8 +285,7 @@ func (h *Handler) resolveVariant(ctx context.Context, idStr string, query url.Va
 	case db.StatusReady:
 		return resolveResult{outcome: outcomeReady, variant: variant}
 	case db.StatusPending:
-		// Already queued — do not republish.
-		return resolveResult{outcome: outcomePending, variant: variant}
+		return h.waitOrSync(ctx, variant)
 	case db.StatusFailed:
 		return resolveResult{outcome: outcomeFailed, variant: variant}
 	default:
@@ -195,20 +293,96 @@ func (h *Handler) resolveVariant(ctx context.Context, idStr string, query url.Va
 	}
 }
 
+func (h *Handler) publishBestEffort(ctx context.Context, variantID uuid.UUID) {
+	if err := h.queue.Publish(ctx, variantID.String()); err != nil {
+		h.log.Warn("best-effort enqueue failed", "err", err, "variant_id", variantID)
+		return
+	}
+	metrics.JobsEnqueuedTotal.Inc()
+}
+
+func (h *Handler) syncGenerate(ctx context.Context, v db.Variant, miss bool) resolveResult {
+	syncCtx, cancel := context.WithTimeout(ctx, h.cfg.SyncTransformTimeout)
+	defer cancel()
+
+	if err := h.variantGen().TransformAndPersist(syncCtx, v); err != nil {
+		h.log.Error("sync transform failed", "err", err, "variant_id", v.ID)
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(syncCtx.Err(), context.DeadlineExceeded) {
+			return resolveResult{outcome: outcomeUnavailable, errMsg: "variant transform timed out", miss: miss}
+		}
+		return resolveResult{outcome: outcomeInternal, errMsg: "failed to generate variant", miss: miss}
+	}
+
+	ready, err := h.store.GetVariantByID(ctx, v.ID)
+	if err != nil {
+		h.log.Error("reload variant after sync", "err", err, "variant_id", v.ID)
+		return resolveResult{outcome: outcomeInternal, errMsg: "failed to load variant", miss: miss}
+	}
+	if ready.Status != db.StatusReady {
+		return resolveResult{outcome: outcomeInternal, errMsg: "variant not ready after sync", miss: miss}
+	}
+	return resolveResult{outcome: outcomeReady, variant: ready, miss: miss}
+}
+
+func (h *Handler) waitOrSync(ctx context.Context, v db.Variant) resolveResult {
+	deadline := time.Now().Add(h.cfg.SyncTransformTimeout)
+	for time.Now().Before(deadline) {
+		current, err := h.store.GetVariantByID(ctx, v.ID)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				return resolveResult{outcome: outcomeNotFound, errMsg: "image not found", waited: true}
+			}
+			h.log.Error("poll variant", "err", err, "variant_id", v.ID)
+			return resolveResult{outcome: outcomeInternal, errMsg: "failed to load variant", waited: true}
+		}
+		switch current.Status {
+		case db.StatusReady:
+			return resolveResult{outcome: outcomeReady, variant: current, waited: true}
+		case db.StatusFailed:
+			return resolveResult{outcome: outcomeFailed, variant: current, waited: true}
+		}
+
+		timer := time.NewTimer(peerReadyPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return resolveResult{outcome: outcomeUnavailable, errMsg: "request cancelled", waited: true}
+		case <-timer.C:
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+	}
+
+	current, err := h.store.GetVariantByID(ctx, v.ID)
+	if err == nil {
+		switch current.Status {
+		case db.StatusReady:
+			return resolveResult{outcome: outcomeReady, variant: current, waited: true}
+		case db.StatusFailed:
+			return resolveResult{outcome: outcomeFailed, variant: current, waited: true}
+		case db.StatusPending:
+			res := h.syncGenerate(ctx, current, false)
+			res.waited = true
+			return res
+		}
+	}
+	return resolveResult{outcome: outcomeUnavailable, errMsg: "variant transform timed out", waited: true}
+}
+
 func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 	res := h.resolveVariant(r.Context(), chi.URLParam(r, "id"), r.URL.Query())
 	switch res.outcome {
 	case outcomeReady:
-		metrics.CacheHitsTotal.Inc()
-		h.serveVariant(w, r, res.variant)
-	case outcomePending:
-		if res.enqueued {
+		if res.miss {
 			metrics.CacheMissesTotal.Inc()
-			metrics.JobsEnqueuedTotal.Inc()
-		} else {
+		} else if res.waited {
 			metrics.CachePendingTotal.Inc()
+		} else {
+			metrics.CacheHitsTotal.Inc()
 		}
-		h.writeAccepted(w)
+		h.serveVariant(w, r, res.variant)
 	case outcomeFailed:
 		metrics.CacheFailedTotal.Inc()
 		h.writeFailed(w, res.variant)
@@ -227,17 +401,15 @@ func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request) {
 	res := h.resolveVariant(r.Context(), chi.URLParam(r, "id"), r.URL.Query())
 	switch res.outcome {
 	case outcomeReady:
-		metrics.CacheHeadHitsTotal.Inc()
+		if res.miss {
+			metrics.CacheHeadMissesTotal.Inc()
+		} else if res.waited {
+			metrics.CacheHeadPendingTotal.Inc()
+		} else {
+			metrics.CacheHeadHitsTotal.Inc()
+		}
 		w.Header().Set("Content-Type", "image/avif")
 		w.WriteHeader(http.StatusOK)
-	case outcomePending:
-		if res.enqueued {
-			metrics.CacheHeadMissesTotal.Inc()
-			metrics.JobsEnqueuedTotal.Inc()
-		} else {
-			metrics.CacheHeadPendingTotal.Inc()
-		}
-		h.writeAccepted(w)
 	case outcomeFailed:
 		metrics.CacheHeadFailedTotal.Inc()
 		w.Header().Set("Content-Type", "application/json")
@@ -315,11 +487,6 @@ func (h *Handler) serveVariant(w http.ResponseWriter, r *http.Request, v db.Vari
 	}
 }
 
-func (h *Handler) writeAccepted(w http.ResponseWriter) {
-	w.Header().Set("Retry-After", strconv.Itoa(h.cfg.RetryAfterSeconds))
-	w.WriteHeader(http.StatusAccepted)
-}
-
 func (h *Handler) writeFailed(w http.ResponseWriter, v db.Variant) {
 	msg := "variant processing failed"
 	if v.LastError != nil && *v.LastError != "" {
@@ -334,9 +501,7 @@ func detectImageType(data []byte, declared string) (contentType, ext string, err
 	if !isAllowedImageType(sniffed) && isAllowedImageType(declared) {
 		ct = declared
 	}
-	// DetectContentType may return "image/jpeg"; WebP sniffing is supported in Go 1.22+.
 	if !isAllowedImageType(ct) {
-		// Fallback: RIFF....WEBP magic (in case sniff misses).
 		if isWebP(data) {
 			ct = "image/webp"
 		} else {
@@ -358,7 +523,6 @@ func detectImageType(data []byte, declared string) (contentType, ext string, err
 
 func isAllowedImageType(ct string) bool {
 	ct = strings.TrimSpace(strings.ToLower(ct))
-	// Strip parameters e.g. "image/jpeg; charset=utf-8"
 	if i := strings.IndexByte(ct, ';'); i >= 0 {
 		ct = strings.TrimSpace(ct[:i])
 	}

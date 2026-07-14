@@ -15,7 +15,7 @@ func TestHandleHead_Ready(t *testing.T) {
 	variantID := uuid.MustParse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 	relPath := "variants/v.avif"
 
-	blob := &mockBlob{} // no getPath — Get must not be called
+	blob := &mockBlob{}
 	q := &mockQueue{}
 	h := newTestHandler(&mockStore{
 		image:   db.Image{ID: imageID},
@@ -46,14 +46,23 @@ func TestHandleHead_Ready(t *testing.T) {
 	}
 }
 
-func TestHandleHead_PendingPoll(t *testing.T) {
+func TestHandleHead_PendingWaitThenReady(t *testing.T) {
 	imageID := uuid.MustParse("cccccccc-cccc-cccc-cccc-cccccccccccc")
 	variantID := uuid.MustParse("dddddddd-dddd-dddd-dddd-dddddddddddd")
+	relPath := "variants/v.avif"
 
 	q := &mockQueue{}
+	calls := 0
 	h := newTestHandler(&mockStore{
 		image:   db.Image{ID: imageID},
 		variant: db.Variant{ID: variantID, Status: db.StatusPending},
+		byIDFn: func() (db.Variant, error) {
+			calls++
+			if calls < 2 {
+				return db.Variant{ID: variantID, Status: db.StatusPending}, nil
+			}
+			return db.Variant{ID: variantID, Status: db.StatusReady, Path: &relPath}, nil
+		},
 	}, q, &mockBlob{})
 
 	before := snapCounters()
@@ -61,11 +70,8 @@ func TestHandleHead_PendingPoll(t *testing.T) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
-	}
-	if ra := resp.Header.Get("Retry-After"); ra != "2" {
-		t.Fatalf("Retry-After = %q, want 2", ra)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 	if len(body) != 0 {
 		t.Fatalf("body len = %d, want 0", len(body))
@@ -80,25 +86,35 @@ func TestHandleHead_PendingPoll(t *testing.T) {
 	}
 }
 
-func TestHandleHead_ColdMiss(t *testing.T) {
+func TestHandleHead_ColdMissSync(t *testing.T) {
 	imageID := uuid.MustParse("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
 	variantID := uuid.MustParse("ffffffff-ffff-ffff-ffff-ffffffffffff")
 
 	q := &mockQueue{}
-	h := newTestHandler(&mockStore{
-		image:         db.Image{ID: imageID},
-		variantErr:    db.ErrNotFound,
-		upsertVariant: db.Variant{ID: variantID, Status: db.StatusPending},
+	store := &mockStore{
+		image: db.Image{
+			ID:           imageID,
+			OriginalPath: "storely/1/catalog/x.jpg",
+		},
+		variantErr: db.ErrNotFound,
+		upsertVariant: db.Variant{
+			ID:         variantID,
+			ImageID:    imageID,
+			ParamsHash: "abc",
+			ParamsJSON: []byte(`{"w":100,"h":0,"crop":"center","q":80,"fit":"cover"}`),
+			Status:     db.StatusPending,
+		},
 		upsertCreated: true,
-	}, q, &mockBlob{})
+	}
+	h := newTestHandler(store, q, &mockBlob{})
 
 	before := snapCounters()
 	resp := doHead(t, h, imageID)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 	if len(body) != 0 {
 		t.Fatalf("body len = %d, want 0", len(body))
@@ -113,6 +129,9 @@ func TestHandleHead_ColdMiss(t *testing.T) {
 	}
 	if got.misses != 0 {
 		t.Fatalf("cache_misses delta = %v, want 0", got.misses)
+	}
+	if store.markReadyCalls != 1 {
+		t.Fatalf("MarkReady calls = %d, want 1", store.markReadyCalls)
 	}
 }
 

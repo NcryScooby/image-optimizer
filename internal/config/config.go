@@ -5,50 +5,60 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// Config holds runtime settings loaded from environment variables.
 type Config struct {
-	DatabaseURL       string
-	RabbitMQURL       string
-	ImgproxyURL       string
-	S3Endpoint        string
-	S3Region          string
-	S3Bucket          string
-	S3AccessKey       string
-	S3SecretKey       string
-	S3UsePathStyle    bool
-	HTTPAddr          string
-	MetricsAddr       string
-	MaxUploadBytes    int64
-	RetryAfterSeconds int
-	DefaultQuality    int
+	DatabaseURL           string
+	RabbitMQURL           string
+	ImgproxyURL           string
+	S3Endpoint            string
+	S3Region              string
+	S3Bucket              string
+	S3AccessKey           string
+	S3SecretKey           string
+	S3UsePathStyle        bool
+	HTTPAddr              string
+	WriteHTTPAddr         string
+	MetricsAddr           string
+	MaxUploadBytes        int64
+	RetryAfterSeconds     int
+	DefaultQuality        int
+	SyncTransformTimeout  time.Duration
+	MTLSEnabled           bool
+	TLSCertFile           string
+	TLSKeyFile            string
+	TLSClientCAFile       string
 }
 
 const (
-	defaultHTTPAddr          = ":8080"
-	defaultMaxUploadBytes    = int64(10 << 20) // 10485760
-	defaultRetryAfterSeconds = 2
-	defaultDefaultQuality    = 80
+	defaultHTTPAddr             = ":8080"
+	defaultMaxUploadBytes       = int64(10 << 20)
+	defaultRetryAfterSeconds    = 2
+	defaultDefaultQuality       = 80
+	defaultSyncTransformTimeout = 25 * time.Second
 )
 
-// Load reads configuration from the environment.
-// DATABASE_URL, RABBITMQ_URL, IMGPROXY_URL, and S3_* are required.
 func Load() (Config, error) {
 	cfg := Config{
-		DatabaseURL:       os.Getenv("DATABASE_URL"),
-		RabbitMQURL:       os.Getenv("RABBITMQ_URL"),
-		ImgproxyURL:       os.Getenv("IMGPROXY_URL"),
-		S3Endpoint:        os.Getenv("S3_ENDPOINT"),
-		S3Region:          os.Getenv("S3_REGION"),
-		S3Bucket:          os.Getenv("S3_BUCKET"),
-		S3AccessKey:       os.Getenv("S3_ACCESS_KEY"),
-		S3SecretKey:       os.Getenv("S3_SECRET_KEY"),
-		HTTPAddr:          getenv("HTTP_ADDR", defaultHTTPAddr),
-		MetricsAddr:       os.Getenv("METRICS_ADDR"), // empty default = metrics off
-		MaxUploadBytes:    defaultMaxUploadBytes,
-		RetryAfterSeconds: defaultRetryAfterSeconds,
-		DefaultQuality:    defaultDefaultQuality,
+		DatabaseURL:          os.Getenv("DATABASE_URL"),
+		RabbitMQURL:          os.Getenv("RABBITMQ_URL"),
+		ImgproxyURL:          os.Getenv("IMGPROXY_URL"),
+		S3Endpoint:           os.Getenv("S3_ENDPOINT"),
+		S3Region:             os.Getenv("S3_REGION"),
+		S3Bucket:             os.Getenv("S3_BUCKET"),
+		S3AccessKey:          os.Getenv("S3_ACCESS_KEY"),
+		S3SecretKey:          os.Getenv("S3_SECRET_KEY"),
+		HTTPAddr:             getenv("HTTP_ADDR", defaultHTTPAddr),
+		WriteHTTPAddr:        os.Getenv("WRITE_HTTP_ADDR"),
+		MetricsAddr:          os.Getenv("METRICS_ADDR"),
+		MaxUploadBytes:       defaultMaxUploadBytes,
+		RetryAfterSeconds:    defaultRetryAfterSeconds,
+		DefaultQuality:       defaultDefaultQuality,
+		SyncTransformTimeout: defaultSyncTransformTimeout,
+		TLSCertFile:          os.Getenv("TLS_CERT_FILE"),
+		TLSKeyFile:           os.Getenv("TLS_KEY_FILE"),
+		TLSClientCAFile:      os.Getenv("TLS_CLIENT_CA_FILE"),
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -81,6 +91,26 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.S3UsePathStyle = pathStyle
+
+	mtls, err := parseOptionalBoolEnv("MTLS_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.MTLSEnabled = mtls
+	if cfg.MTLSEnabled {
+		if cfg.TLSCertFile == "" {
+			return Config{}, fmt.Errorf("TLS_CERT_FILE is required when MTLS_ENABLED=true")
+		}
+		if cfg.TLSKeyFile == "" {
+			return Config{}, fmt.Errorf("TLS_KEY_FILE is required when MTLS_ENABLED=true")
+		}
+		if cfg.TLSClientCAFile == "" {
+			return Config{}, fmt.Errorf("TLS_CLIENT_CA_FILE is required when MTLS_ENABLED=true")
+		}
+		if cfg.WriteHTTPAddr == "" {
+			return Config{}, fmt.Errorf("WRITE_HTTP_ADDR is required when MTLS_ENABLED=true")
+		}
+	}
 
 	if v := os.Getenv("MAX_UPLOAD_BYTES"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -115,6 +145,17 @@ func Load() (Config, error) {
 		cfg.DefaultQuality = n
 	}
 
+	if v := os.Getenv("SYNC_TRANSFORM_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("SYNC_TRANSFORM_TIMEOUT: %w", err)
+		}
+		if d <= 0 {
+			return Config{}, fmt.Errorf("SYNC_TRANSFORM_TIMEOUT must be > 0")
+		}
+		cfg.SyncTransformTimeout = d
+	}
+
 	return cfg, nil
 }
 
@@ -129,6 +170,18 @@ func parseBoolEnv(key string) (bool, error) {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
 		return false, fmt.Errorf("%s is required", key)
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", key, err)
+	}
+	return b, nil
+}
+
+func parseOptionalBoolEnv(key string, fallback bool) (bool, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback, nil
 	}
 	b, err := strconv.ParseBool(v)
 	if err != nil {

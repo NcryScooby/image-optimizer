@@ -24,12 +24,12 @@ var (
 	CacheMissesTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Name:      "cache_misses_total",
-		Help:      "Cold cache misses that upserted a variant and published a job",
+		Help:      "Cold cache misses that generated a variant inline and returned 200",
 	})
 	CachePendingTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Name:      "cache_pending_total",
-		Help:      "GET polls that found a pending variant",
+		Help:      "GET requests that waited for an in-flight variant then served 200",
 	})
 	CacheFailedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
@@ -44,12 +44,12 @@ var (
 	CacheHeadMissesTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Name:      "cache_head_misses_total",
-		Help:      "Cold cache misses that upserted a variant and published a job",
+		Help:      "Cold cache misses that generated a variant inline and returned 200",
 	})
 	CacheHeadPendingTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Name:      "cache_head_pending_total",
-		Help:      "HEAD polls that found a pending variant",
+		Help:      "HEAD requests that waited for an in-flight variant then returned 200",
 	})
 	CacheHeadFailedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
@@ -59,7 +59,7 @@ var (
 	JobsEnqueuedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Name:      "jobs_enqueued_total",
-		Help:      "Jobs successfully published to the queue",
+		Help:      "Best-effort jobs published to the warm/async queue",
 	})
 
 	// Worker metrics.

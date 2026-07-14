@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,7 +17,7 @@ import (
 	"github.com/notrealscooby/image-optimizer/internal/db"
 	apihttp "github.com/notrealscooby/image-optimizer/internal/http"
 	"github.com/notrealscooby/image-optimizer/internal/imgproxy"
-	_ "github.com/notrealscooby/image-optimizer/internal/metrics" // register Prometheus metrics
+	_ "github.com/notrealscooby/image-optimizer/internal/metrics"
 	"github.com/notrealscooby/image-optimizer/internal/queue"
 	"github.com/notrealscooby/image-optimizer/internal/storage"
 	"github.com/notrealscooby/image-optimizer/internal/worker"
@@ -79,19 +82,65 @@ func runServe() error {
 	}
 	defer q.Close()
 
-	h := apihttp.NewHandler(store, stor, q, cfg)
-	router := apihttp.NewRouter(h)
+	img := imgproxy.New(cfg.ImgproxyURL)
+	h := apihttp.NewHandler(store, stor, q, img, cfg)
 
+	if cfg.MTLSEnabled {
+		return serveDual(ctx, h, cfg)
+	}
+	return serveSingle(ctx, h, cfg)
+}
+
+func serveSingle(ctx context.Context, h *apihttp.Handler, cfg config.Config) error {
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           router,
+		Handler:           apihttp.NewRouter(h),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		slog.Info("http listening", "addr", cfg.HTTPAddr)
+		slog.Info("http listening", "addr", cfg.HTTPAddr, "mtls", false)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	return waitShutdown(ctx, errCh, srv)
+}
+
+func serveDual(ctx context.Context, h *apihttp.Handler, cfg config.Config) error {
+	tlsCfg, err := clientAuthTLSConfig(cfg)
+	if err != nil {
+		return err
+	}
+
+	publicSrv := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           apihttp.NewPublicRouter(h),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	writeSrv := &http.Server{
+		Addr:              cfg.WriteHTTPAddr,
+		Handler:           apihttp.NewWriteRouter(h),
+		TLSConfig:         tlsCfg,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	errCh := make(chan error, 2)
+	go func() {
+		slog.Info("http public listening", "addr", cfg.HTTPAddr)
+		if err := publicSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+	go func() {
+		slog.Info("https write listening", "addr", cfg.WriteHTTPAddr, "mtls", true)
+		if err := writeSrv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
 		}
@@ -100,16 +149,58 @@ func runServe() error {
 
 	select {
 	case <-ctx.Done():
+		slog.Info("shutting down http servers")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = publicSrv.Shutdown(shutdownCtx)
+		_ = writeSrv.Shutdown(shutdownCtx)
+		var first error
+		for i := 0; i < 2; i++ {
+			if err := <-errCh; err != nil && first == nil {
+				first = err
+			}
+		}
+		return first
+	case err := <-errCh:
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = publicSrv.Shutdown(shutdownCtx)
+		_ = writeSrv.Shutdown(shutdownCtx)
+		return err
+	}
+}
+
+func waitShutdown(ctx context.Context, errCh <-chan error, servers ...*http.Server) error {
+	select {
+	case <-ctx.Done():
 		slog.Info("shutting down http server")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			return err
+		for _, srv := range servers {
+			if err := srv.Shutdown(shutdownCtx); err != nil {
+				return err
+			}
 		}
 		return <-errCh
 	case err := <-errCh:
 		return err
 	}
+}
+
+func clientAuthTLSConfig(cfg config.Config) (*tls.Config, error) {
+	caPEM, err := os.ReadFile(cfg.TLSClientCAFile)
+	if err != nil {
+		return nil, fmt.Errorf("read TLS_CLIENT_CA_FILE: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("TLS_CLIENT_CA_FILE: no certificates found")
+	}
+	return &tls.Config{
+		ClientCAs:  pool,
+		ClientAuth: tls.RequireAndVerifyClientCert,
+		MinVersion: tls.VersionTLS12,
+	}, nil
 }
 
 func runWorker() error {

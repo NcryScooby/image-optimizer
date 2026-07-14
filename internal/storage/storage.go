@@ -23,7 +23,7 @@ import (
 //
 // Layout (object keys):
 //
-//	originals/{id}.{ext}
+//	{folder}/{id}.{ext}
 //	variants/{id}/{params_hash}.avif
 type Storage struct {
 	client *s3.Client
@@ -68,21 +68,25 @@ func (s *Storage) Bucket() string {
 	return s.bucket
 }
 
-// SaveOriginal writes the original image to originals/{id}.{ext}.
-// Returns a relative object key (e.g. "originals/{id}.{ext}").
-func (s *Storage) SaveOriginal(ctx context.Context, id, ext string, data []byte) (string, error) {
+// SaveOriginal writes the original image to {folder}/{id}.{ext}.
+// Returns a relative object key (e.g. "storely/1/catalog/{id}.{ext}").
+func (s *Storage) SaveOriginal(ctx context.Context, folder, id, ext string, data []byte) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	if err := validateID(id); err != nil {
 		return "", err
 	}
-	ext, err := sanitizeExt(ext)
+	folderKey, err := normalizeFolder(folder)
+	if err != nil {
+		return "", err
+	}
+	ext, err = sanitizeExt(ext)
 	if err != nil {
 		return "", err
 	}
 
-	key := path.Join("originals", id+"."+ext)
+	key := path.Join(folderKey, id+"."+ext)
 	if err := s.putObject(ctx, key, data); err != nil {
 		return "", fmt.Errorf("storage: put original: %w", err)
 	}
@@ -116,7 +120,7 @@ func (s *Storage) WriteVariant(ctx context.Context, imageID, paramsHash string, 
 }
 
 // DeleteImageFiles removes the original object and all objects under variants/{imageID}/.
-// originalPath is a relative object key (e.g. "originals/{id}.ext").
+// originalPath is a relative object key (e.g. "storely/1/catalog/{id}.ext").
 func (s *Storage) DeleteImageFiles(ctx context.Context, imageID, originalPath string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -267,6 +271,21 @@ func normalizeKey(relPath string) (string, error) {
 	}
 	if strings.HasPrefix(key, "..") || strings.Contains(key, "/../") {
 		return "", fmt.Errorf("storage: path escapes bucket")
+	}
+	return key, nil
+}
+
+func normalizeFolder(folder string) (string, error) {
+	folder = strings.Trim(strings.ReplaceAll(folder, "\\", "/"), "/")
+	if folder == "" {
+		return "", fmt.Errorf("storage: folder is required")
+	}
+	if strings.Contains(folder, "..") {
+		return "", fmt.Errorf("storage: invalid folder")
+	}
+	key, err := normalizeKey(folder)
+	if err != nil {
+		return "", fmt.Errorf("storage: invalid folder: %w", err)
 	}
 	return key, nil
 }

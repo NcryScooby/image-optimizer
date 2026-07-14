@@ -1,15 +1,18 @@
 package http
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -28,12 +31,20 @@ type mockStore struct {
 	upsertVariant  db.Variant
 	upsertCreated  bool
 	upsertErr      error
-	deletePendingN int
+	byID           db.Variant
+	byIDErr        error
+	byIDFn         func() (db.Variant, error)
+	markReadyPath  string
+	markReadyCalls int
 	pingErr        error
+	insertPath     string
+	insertCalls    int
 }
 
-func (m *mockStore) InsertImage(context.Context, uuid.UUID, string, string, int64) (db.Image, error) {
-	return db.Image{}, errors.New("not implemented")
+func (m *mockStore) InsertImage(_ context.Context, id uuid.UUID, originalPath, contentType string, sizeBytes int64) (db.Image, error) {
+	m.insertCalls++
+	m.insertPath = originalPath
+	return db.Image{ID: id, OriginalPath: originalPath, ContentType: contentType, SizeBytes: sizeBytes}, nil
 }
 func (m *mockStore) GetImage(context.Context, uuid.UUID) (db.Image, error) {
 	if m.imageErr != nil {
@@ -50,17 +61,38 @@ func (m *mockStore) GetVariantByHash(context.Context, uuid.UUID, string) (db.Var
 	}
 	return m.variant, nil
 }
+func (m *mockStore) GetVariantByID(context.Context, uuid.UUID) (db.Variant, error) {
+	if m.byIDFn != nil {
+		return m.byIDFn()
+	}
+	if m.byIDErr != nil {
+		return db.Variant{}, m.byIDErr
+	}
+	if m.byID.ID != uuid.Nil {
+		return m.byID, nil
+	}
+	return m.upsertVariant, nil
+}
 func (m *mockStore) UpsertPendingVariant(context.Context, uuid.UUID, string, []byte) (db.Variant, bool, error) {
 	if m.upsertErr != nil {
 		return db.Variant{}, false, m.upsertErr
 	}
 	return m.upsertVariant, m.upsertCreated, nil
 }
-func (m *mockStore) DeletePendingVariant(context.Context, uuid.UUID) error {
-	m.deletePendingN++
+func (m *mockStore) MarkReady(_ context.Context, id uuid.UUID, path string) error {
+	m.markReadyCalls++
+	m.markReadyPath = path
+	ready := m.upsertVariant
+	if ready.ID == uuid.Nil {
+		ready = m.variant
+	}
+	ready.ID = id
+	ready.Status = db.StatusReady
+	ready.Path = &path
+	m.byID = ready
+	m.upsertVariant = ready
 	return nil
 }
-
 func (m *mockStore) Ping(context.Context) error { return m.pingErr }
 
 type mockQueue struct {
@@ -80,12 +112,33 @@ func (m *mockQueue) Publish(_ context.Context, variantID string) error {
 func (m *mockQueue) Ping(context.Context) error { return m.pingErr }
 
 type mockBlob struct {
-	getPath  string
-	getCalls int
+	getPath       string
+	getCalls      int
+	writeCalls    int
+	writePath     string
+	saveFolder    string
+	saveID        string
+	saveCalls     int
+	saveErr       error
+	writeErr      error
 }
 
-func (m *mockBlob) SaveOriginal(context.Context, string, string, []byte) (string, error) {
-	return "", errors.New("not implemented")
+func (m *mockBlob) SaveOriginal(_ context.Context, folder, id, ext string, data []byte) (string, error) {
+	m.saveCalls++
+	m.saveFolder = folder
+	m.saveID = id
+	if m.saveErr != nil {
+		return "", m.saveErr
+	}
+	return folder + "/" + id + "." + ext, nil
+}
+func (m *mockBlob) WriteVariant(_ context.Context, imageID, paramsHash string, data []byte) (string, error) {
+	m.writeCalls++
+	if m.writeErr != nil {
+		return "", m.writeErr
+	}
+	m.writePath = "variants/" + imageID + "/" + paramsHash + ".avif"
+	return m.writePath, nil
 }
 func (m *mockBlob) DeleteImageFiles(context.Context, string, string) error {
 	return errors.New("not implemented")
@@ -105,6 +158,23 @@ func (m *mockBlob) Get(_ context.Context, _ string) (io.ReadCloser, int64, error
 		return nil, 0, err
 	}
 	return f, stat.Size(), nil
+}
+
+type mockImgproxy struct {
+	data  []byte
+	err   error
+	calls int
+}
+
+func (m *mockImgproxy) Fetch(context.Context, string) ([]byte, error) {
+	m.calls++
+	if m.err != nil {
+		return nil, m.err
+	}
+	if m.data != nil {
+		return m.data, nil
+	}
+	return []byte("avif-bytes"), nil
 }
 
 type counterSnap struct {
@@ -141,12 +211,22 @@ func (c counterSnap) delta(after counterSnap) counterSnap {
 }
 
 func newTestHandler(store *mockStore, q *mockQueue, blob *mockBlob) *Handler {
+	return newTestHandlerWithImg(store, q, blob, &mockImgproxy{})
+}
+
+func newTestHandlerWithImg(store *mockStore, q *mockQueue, blob *mockBlob, img *mockImgproxy) *Handler {
 	return &Handler{
-		store:   store,
-		storage: blob,
-		queue:   q,
-		cfg:     config.Config{RetryAfterSeconds: 2},
-		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:    store,
+		storage:  blob,
+		queue:    q,
+		imgproxy: img,
+		cfg: config.Config{
+			RetryAfterSeconds:    2,
+			SyncTransformTimeout: 200 * time.Millisecond,
+			S3Bucket:             "images",
+			MaxUploadBytes:       10 << 20,
+		},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 }
 
@@ -191,6 +271,13 @@ func mustTempAVIF(t *testing.T) string {
 	return path
 }
 
+func jpegBytes() []byte {
+	return []byte{
+		0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
+		0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
+	}
+}
+
 func TestHandleGet_CacheMetrics(t *testing.T) {
 	imageID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
 	variantID := uuid.MustParse("22222222-2222-2222-2222-222222222222")
@@ -209,9 +296,8 @@ func TestHandleGet_CacheMetrics(t *testing.T) {
 				path := mustTempAVIF(t)
 				q := &mockQueue{}
 				h := newTestHandler(&mockStore{
-					image:      db.Image{ID: imageID},
-					variant:    db.Variant{ID: variantID, Status: db.StatusReady, Path: &relPath},
-					variantErr: nil,
+					image:   db.Image{ID: imageID, OriginalPath: "storely/1/catalog/" + imageID.String() + ".jpg"},
+					variant: db.Variant{ID: variantID, Status: db.StatusReady, Path: &relPath},
 				}, q, &mockBlob{getPath: path})
 				return h, q
 			},
@@ -219,18 +305,30 @@ func TestHandleGet_CacheMetrics(t *testing.T) {
 			want:       counterSnap{hits: 1},
 		},
 		{
-			name: "cold miss increments misses and enqueued",
+			name: "cold miss sync returns 200 and increments misses and enqueued",
 			setup: func(t *testing.T) (*Handler, *mockQueue) {
+				path := mustTempAVIF(t)
 				q := &mockQueue{}
-				h := newTestHandler(&mockStore{
-					image:         db.Image{ID: imageID},
-					variantErr:    db.ErrNotFound,
-					upsertVariant: db.Variant{ID: variantID, Status: db.StatusPending},
+				store := &mockStore{
+					image: db.Image{
+						ID:           imageID,
+						OriginalPath: "storely/1/catalog/" + imageID.String() + ".jpg",
+					},
+					variantErr: db.ErrNotFound,
+					upsertVariant: db.Variant{
+						ID:         variantID,
+						ImageID:    imageID,
+						ParamsHash: "abc",
+						ParamsJSON: []byte(`{"w":100,"h":0,"crop":"center","q":80,"fit":"cover"}`),
+						Status:     db.StatusPending,
+					},
 					upsertCreated: true,
-				}, q, &mockBlob{})
+				}
+				blob := &mockBlob{getPath: path}
+				h := newTestHandler(store, q, blob)
 				return h, q
 			},
-			wantStatus: http.StatusAccepted,
+			wantStatus: http.StatusOK,
 			want:       counterSnap{misses: 1, enqueued: 1},
 			checkQueue: func(t *testing.T, q *mockQueue) {
 				if len(q.published) != 1 || q.published[0] != variantID.String() {
@@ -239,16 +337,26 @@ func TestHandleGet_CacheMetrics(t *testing.T) {
 			},
 		},
 		{
-			name: "pending poll increments pending not miss",
+			name: "pending wait then ready increments pending",
 			setup: func(t *testing.T) (*Handler, *mockQueue) {
+				path := mustTempAVIF(t)
 				q := &mockQueue{}
-				h := newTestHandler(&mockStore{
-					image:   db.Image{ID: imageID},
+				calls := 0
+				store := &mockStore{
+					image:   db.Image{ID: imageID, OriginalPath: "storely/1/catalog/x.jpg"},
 					variant: db.Variant{ID: variantID, Status: db.StatusPending},
-				}, q, &mockBlob{})
+					byIDFn: func() (db.Variant, error) {
+						calls++
+						if calls < 2 {
+							return db.Variant{ID: variantID, Status: db.StatusPending}, nil
+						}
+						return db.Variant{ID: variantID, Status: db.StatusReady, Path: &relPath}, nil
+					},
+				}
+				h := newTestHandler(store, q, &mockBlob{getPath: path})
 				return h, q
 			},
-			wantStatus: http.StatusAccepted,
+			wantStatus: http.StatusOK,
 			want:       counterSnap{pending: 1},
 			checkQueue: func(t *testing.T, q *mockQueue) {
 				if len(q.published) != 0 {
@@ -287,39 +395,30 @@ func TestHandleGet_CacheMetrics(t *testing.T) {
 			want:       counterSnap{hits: 1},
 		},
 		{
-			name: "upsert race pending without create increments pending not miss",
+			name: "publish fail still syncs on cold miss",
 			setup: func(t *testing.T) (*Handler, *mockQueue) {
-				q := &mockQueue{}
-				h := newTestHandler(&mockStore{
-					image:         db.Image{ID: imageID},
-					variantErr:    db.ErrNotFound,
-					upsertVariant: db.Variant{ID: variantID, Status: db.StatusPending},
-					upsertCreated: false,
-				}, q, &mockBlob{})
-				return h, q
-			},
-			wantStatus: http.StatusAccepted,
-			want:       counterSnap{pending: 1},
-			checkQueue: func(t *testing.T, q *mockQueue) {
-				if len(q.published) != 0 {
-					t.Fatalf("published = %v, want none", q.published)
-				}
-			},
-		},
-		{
-			name: "publish fail increments neither miss nor enqueued",
-			setup: func(t *testing.T) (*Handler, *mockQueue) {
+				path := mustTempAVIF(t)
 				q := &mockQueue{err: errors.New("amqp down")}
-				h := newTestHandler(&mockStore{
-					image:         db.Image{ID: imageID},
-					variantErr:    db.ErrNotFound,
-					upsertVariant: db.Variant{ID: variantID, Status: db.StatusPending},
+				store := &mockStore{
+					image: db.Image{
+						ID:           imageID,
+						OriginalPath: "storely/1/catalog/x.jpg",
+					},
+					variantErr: db.ErrNotFound,
+					upsertVariant: db.Variant{
+						ID:         variantID,
+						ImageID:    imageID,
+						ParamsHash: "abc",
+						ParamsJSON: []byte(`{"w":100,"h":0,"crop":"center","q":80,"fit":"cover"}`),
+						Status:     db.StatusPending,
+					},
 					upsertCreated: true,
-				}, q, &mockBlob{})
+				}
+				h := newTestHandler(store, q, &mockBlob{getPath: path})
 				return h, q
 			},
-			wantStatus: http.StatusServiceUnavailable,
-			want:       counterSnap{},
+			wantStatus: http.StatusOK,
+			want:       counterSnap{misses: 1},
 		},
 		{
 			name: "race failed after upsert increments failed",
@@ -358,44 +457,174 @@ func TestHandleGet_CacheMetrics(t *testing.T) {
 	}
 }
 
-func TestHandleGet_MissIsNotPending(t *testing.T) {
+func TestHandleGet_ColdMissNever202(t *testing.T) {
 	imageID := uuid.MustParse("33333333-3333-3333-3333-333333333333")
 	variantID := uuid.MustParse("44444444-4444-4444-4444-444444444444")
+	path := mustTempAVIF(t)
 
-	// Cold miss
-	before := snapCounters()
-	hMiss, _ := func() (*Handler, *mockQueue) {
-		q := &mockQueue{}
-		return newTestHandler(&mockStore{
-			image:         db.Image{ID: imageID},
-			variantErr:    db.ErrNotFound,
-			upsertVariant: db.Variant{ID: variantID, Status: db.StatusPending},
-			upsertCreated: true,
-		}, q, &mockBlob{}), q
-	}()
-	resp := doGet(t, hMiss, imageID)
-	resp.Body.Close()
-	missDelta := before.delta(snapCounters())
-	if missDelta.misses != 1 || missDelta.pending != 0 || missDelta.enqueued != 1 {
-		t.Fatalf("cold miss deltas = %+v, want misses=1 pending=0 enqueued=1", missDelta)
+	store := &mockStore{
+		image: db.Image{
+			ID:           imageID,
+			OriginalPath: "storely/1/catalog/x.jpg",
+		},
+		variantErr: db.ErrNotFound,
+		upsertVariant: db.Variant{
+			ID:         variantID,
+			ImageID:    imageID,
+			ParamsHash: "abc",
+			ParamsJSON: []byte(`{"w":100,"h":0,"crop":"center","q":80,"fit":"cover"}`),
+			Status:     db.StatusPending,
+		},
+		upsertCreated: true,
+	}
+	h := newTestHandler(store, &mockQueue{}, &mockBlob{getPath: path})
+	resp := doGet(t, h, imageID)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if resp.Header.Get("Content-Type") != "image/avif" {
+		t.Fatalf("Content-Type = %q", resp.Header.Get("Content-Type"))
+	}
+	if store.markReadyCalls != 1 {
+		t.Fatalf("MarkReady calls = %d, want 1", store.markReadyCalls)
+	}
+}
+
+func TestHandleUpload_FolderKey(t *testing.T) {
+	blob := &mockBlob{}
+	store := &mockStore{}
+	h := newTestHandler(store, &mockQueue{}, blob)
+
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField("folder", "storely/1/catalog")
+	part, err := w.CreateFormFile("file", "sample.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(jpegBytes()); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/images", &buf)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	rr := httptest.NewRecorder()
+	h.handleUpload(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if blob.saveFolder != "storely/1/catalog" {
+		t.Fatalf("save folder = %q", blob.saveFolder)
+	}
+	if store.insertCalls != 1 {
+		t.Fatalf("insertCalls = %d", store.insertCalls)
+	}
+	if store.insertPath != "storely/1/catalog/"+blob.saveID+".jpg" {
+		t.Fatalf("insertPath = %q", store.insertPath)
+	}
+}
+
+func TestHandleUpload_MissingFolder(t *testing.T) {
+	h := newTestHandler(&mockStore{}, &mockQueue{}, &mockBlob{})
+
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	part, err := w.CreateFormFile("file", "sample.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(jpegBytes()); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/images", &buf)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	rr := httptest.NewRecorder()
+	h.handleUpload(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestHandleCopy_CopiesOriginalToNewFolder(t *testing.T) {
+	tmp := t.TempDir()
+	srcFile := filepath.Join(tmp, "src.jpg")
+	jpeg := jpegBytes()
+	if err := os.WriteFile(srcFile, jpeg, 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	// Pending poll
-	before = snapCounters()
-	hPend, q := func() (*Handler, *mockQueue) {
-		q := &mockQueue{}
-		return newTestHandler(&mockStore{
-			image:   db.Image{ID: imageID},
-			variant: db.Variant{ID: variantID, Status: db.StatusPending},
-		}, q, &mockBlob{}), q
-	}()
-	resp = doGet(t, hPend, imageID)
-	resp.Body.Close()
-	pendDelta := before.delta(snapCounters())
-	if pendDelta.pending != 1 || pendDelta.misses != 0 || pendDelta.enqueued != 0 {
-		t.Fatalf("pending poll deltas = %+v, want pending=1 misses=0 enqueued=0", pendDelta)
+	srcID := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
+	store := &mockStore{
+		image: db.Image{
+			ID:           srcID,
+			OriginalPath: "storely/1/catalog/" + srcID.String() + ".jpg",
+			ContentType:  "image/jpeg",
+			SizeBytes:    int64(len(jpeg)),
+		},
 	}
-	if len(q.published) != 0 {
-		t.Fatalf("pending poll must not publish, got %v", q.published)
+	blob := &mockBlob{getPath: srcFile}
+	h := newTestHandler(store, &mockQueue{}, blob)
+
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField("folder", "storely/1/catalog")
+	_ = w.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/images/"+srcID.String()+"/copy", &buf)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", srcID.String())
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	rr := httptest.NewRecorder()
+	h.handleCopy(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if blob.getCalls != 1 {
+		t.Fatalf("getCalls = %d", blob.getCalls)
+	}
+	if blob.saveFolder != "storely/1/catalog" {
+		t.Fatalf("save folder = %q", blob.saveFolder)
+	}
+	if blob.saveID == srcID.String() {
+		t.Fatal("copy must allocate a new image id")
+	}
+	if store.insertCalls != 1 {
+		t.Fatalf("insertCalls = %d", store.insertCalls)
+	}
+	if store.insertPath != "storely/1/catalog/"+blob.saveID+".jpg" {
+		t.Fatalf("insertPath = %q", store.insertPath)
+	}
+}
+
+func TestHandleCopy_NotFound(t *testing.T) {
+	srcID := uuid.New()
+	store := &mockStore{imageErr: db.ErrNotFound}
+	h := newTestHandler(store, &mockQueue{}, &mockBlob{})
+
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField("folder", "storely/1/catalog")
+	_ = w.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/images/"+srcID.String()+"/copy", &buf)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", srcID.String())
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	rr := httptest.NewRecorder()
+	h.handleCopy(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rr.Code)
 	}
 }
